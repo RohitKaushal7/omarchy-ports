@@ -210,10 +210,13 @@ def split_endpoint(text: str) -> tuple[str, int] | None:
     host, colon, port = text.rpartition(":")
     if not colon or not port.isdigit():
         return None
+    # ss appends the interface to a socket bound to one (127.0.0.53%lo), and
+    # for IPv6 it goes outside the brackets ([fe80::1]%wlo1), so it has to
+    # come off before the brackets can.
+    host = host.split("%", 1)[0]
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
-    # ss appends the interface to link-scoped binds (127.0.0.53%lo).
-    return host.split("%", 1)[0], int(port)
+    return host, int(port)
 
 
 def parse_sockets(text: str, proto: str) -> list[dict]:

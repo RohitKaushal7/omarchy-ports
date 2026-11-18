@@ -12,11 +12,15 @@ import ports  # noqa: E402
 # Captured from `ss -H -ltnp` as a normal user. Sockets owned by root or by
 # another user carry no users:() field; the user's own sockets do. Process
 # names can contain spaces, and a socket inherited by forked workers lists
-# every process holding it.
+# every process holding it. A socket bound to one interface (tailscaled's,
+# the DHCPv6 client's) carries a %iface after the address, outside the
+# brackets of an IPv6 one.
 SS_TCP = """\
 LISTEN 0      4096                       0.0.0.0:6379  0.0.0.0:*
 LISTEN 0      4096                 127.0.0.53%lo:53    0.0.0.0:*
 LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]:65009    [::]:*
+LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]%tailscale0:65010    [::]:*
+LISTEN 0      4096                   100.90.0.14%tailscale0:57203 0.0.0.0:*
 LISTEN 0      128                          [::1]:51725    [::]:* users:(("python3",pid=112443,fd=6))
 LISTEN 0      511                        0.0.0.0:8080  0.0.0.0:* users:(("nginx",pid=911,fd=6),("nginx",pid=907,fd=6))
 LISTEN 0      128                      127.0.0.1:3000  0.0.0.0:* users:(("Web Content",pid=5150,fd=41))
@@ -27,6 +31,7 @@ not a socket line
 SS_UDP = """\
 UNCONN 0      0                             127.0.0.1:57983 0.0.0.0:* users:(("python3",pid=112443,fd=7))
 UNCONN 0      0                                     *:5353        *:*
+UNCONN 0      0      [fe80::57c3:2a98:8b6a:e7ed]%wlo1:546      [::]:*
 """
 
 POSTGRES_ID = "cf700d1b5f1e09c6859c55e74ad917fccb629810d60b67264fae300bb22e4a5b"
@@ -118,6 +123,8 @@ class ParseSocketsTests(unittest.TestCase):
             {"proto": "tcp", "address": "0.0.0.0", "port": 6379, "processes": []},
             {"proto": "tcp", "address": "127.0.0.53", "port": 53, "processes": []},
             {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65009, "processes": []},
+            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65010, "processes": []},
+            {"proto": "tcp", "address": "100.90.0.14", "port": 57203, "processes": []},
             {"proto": "tcp", "address": "::1", "port": 51725,
              "processes": [{"name": "python3", "pid": 112443}]},
             {"proto": "tcp", "address": "0.0.0.0", "port": 8080,
@@ -131,7 +138,31 @@ class ParseSocketsTests(unittest.TestCase):
             {"proto": "udp", "address": "127.0.0.1", "port": 57983,
              "processes": [{"name": "python3", "pid": 112443}]},
             {"proto": "udp", "address": "*", "port": 5353, "processes": []},
+            {"proto": "udp", "address": "fe80::57c3:2a98:8b6a:e7ed", "port": 546, "processes": []},
         ])
+
+
+class SplitEndpointTests(unittest.TestCase):
+    def test_plain_addresses(self):
+        self.assertEqual(ports.split_endpoint("0.0.0.0:22"), ("0.0.0.0", 22))
+        self.assertEqual(ports.split_endpoint("[::1]:631"), ("::1", 631))
+        self.assertEqual(ports.split_endpoint("*:5353"), ("*", 5353))
+
+    def test_interface_suffix_is_removed(self):
+        self.assertEqual(ports.split_endpoint("127.0.0.53%lo:53"), ("127.0.0.53", 53))
+        self.assertEqual(ports.split_endpoint("100.90.0.14%tailscale0:57203"), ("100.90.0.14", 57203))
+
+    def test_interface_suffix_after_ipv6_brackets_is_removed_with_them(self):
+        # ss puts the interface outside the brackets, so the brackets only
+        # close the host once it is gone.
+        self.assertEqual(ports.split_endpoint("[fe80::57c3:2a98:8b6a:e7ed]%wlo1:546"),
+                         ("fe80::57c3:2a98:8b6a:e7ed", 546))
+        self.assertEqual(ports.split_endpoint("[fd7a:115c:a1e0::6c01:74c1]%tailscale0:65009"),
+                         ("fd7a:115c:a1e0::6c01:74c1", 65009))
+
+    def test_not_an_endpoint(self):
+        for text in ("", "nonsense", "1.2.3.4:", "1.2.3.4:http"):
+            self.assertIsNone(ports.split_endpoint(text), text)
 
 
 class ContainerPortsTests(unittest.TestCase):
@@ -273,6 +304,13 @@ class BuildListenersTests(unittest.TestCase):
 
     def test_ipv6_address_is_bracketed_in_url(self):
         [listener] = build([sock("fd7a:115c:a1e0::6c01:74c1", 65009)])
+        self.assertEqual(listener["url"], "http://[fd7a:115c:a1e0::6c01:74c1]:65009")
+
+    def test_scoped_vpn_ipv6_socket_is_vpn_with_a_working_url(self):
+        line = "LISTEN 0 4096 [fd7a:115c:a1e0::6c01:74c1]%tailscale0:65009 [::]:*\n"
+        [listener] = build(ports.parse_sockets(line, "tcp"))
+        self.assertEqual(listener["addresses"], ["fd7a:115c:a1e0::6c01:74c1"])
+        self.assertEqual(listener["scope"], "overlay")
         self.assertEqual(listener["url"], "http://[fd7a:115c:a1e0::6c01:74c1]:65009")
 
     def test_widest_reach_sets_scope_but_loopback_keeps_localhost_url(self):
