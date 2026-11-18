@@ -169,6 +169,7 @@ Everything runs as your user, with no elevated privileges.
 ## Development
 
 - `Panel.qml` — bar icon, popup, sections, keyboard and confirmation.
+- `lib/ScanQueue.qml` — one scan at a time, rerunning one asked for mid-scan.
 - `bin/ports.py` — `scan` prints every listener as JSON; `signal` and `stop`
   act on one. Run it directly to see what the panel sees:
 
@@ -178,7 +179,10 @@ Everything runs as your user, with no elevated privileges.
 
 - `tests/` — `test_ports.py` covers parsing, grouping and output bounds from
   captured `ss` and `docker inspect` output; `test_ports_system.py` runs
-  against real child processes, the real `ss`, and a stand-in `docker`.
+  against real child processes, the real `ss`, and a stand-in `docker`;
+  `test_panel_markup.py` checks the QML keeps to the host's plain-text and
+  motion rules; `test_panel_qml.py` runs `tests/qml` under Qt 6's
+  `qmltestrunner`, and skips it where that isn't installed.
 
 ```bash
 python3 -m unittest discover -s tests
