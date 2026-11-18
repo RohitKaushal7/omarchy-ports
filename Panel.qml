@@ -19,6 +19,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "lib"
 
 Panel {
   id: root
@@ -134,8 +135,13 @@ Panel {
     return command
   }
 
+  // Every refresh goes through the queue, so one asked for mid-scan (a
+  // setting just saved, say) runs as soon as that scan exits.
   function refresh() {
-    if (scanner.running) return
+    scanQueue.request()
+  }
+
+  function startScan() {
     root.scanAbort = ""
     scanner.command = root.scanCommand()
     scanner.running = true
@@ -500,10 +506,17 @@ Panel {
     }
   }
 
+  ScanQueue {
+    id: scanQueue
+    busy: scanner.running
+    onStart: root.startScan()
+  }
+
   Process {
     id: scanner
     clearEnvironment: true
     environment: root.helperEnvironment
+    onExited: scanQueue.finished()
     stdout: StdioCollector {
       id: scanOutput
       waitForEnd: true
