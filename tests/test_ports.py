@@ -1,6 +1,7 @@
 """Behaviour of the Ports collector: turning ss and docker output into listeners."""
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,7 +54,7 @@ DOCKER_INSPECT = [
                 "com.docker.compose.project.working_dir": "/home/alice/src/shop",
             },
         },
-        "State": {"Running": True, "Status": "running"},
+        "State": {"Running": True, "Status": "running", "StartedAt": "2026-11-17T09:12:44.123456789Z"},
         "NetworkSettings": {
             "Ports": {
                 "5432/tcp": [
@@ -67,7 +68,7 @@ DOCKER_INSPECT = [
         "Id": WEB_ID,
         "Name": "/scratch-web",
         "Config": {"Image": "nginx:alpine", "Labels": None},
-        "State": {"Running": True, "Status": "running"},
+        "State": {"Running": True, "Status": "running", "StartedAt": "2026-11-18T13:14:00+05:30"},
         "NetworkSettings": {
             "Ports": {
                 "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8088"}],
@@ -169,9 +170,9 @@ class SplitEndpointTests(unittest.TestCase):
 class ContainerPortsTests(unittest.TestCase):
     def test_published_bindings_of_running_containers(self):
         postgres = {"id": POSTGRES_ID, "name": "postgres", "image": "postgres:18",
-                    "project": "shop", "service": "postgres"}
+                    "project": "shop", "service": "postgres", "startedAt": 1794906764}
         web = {"id": WEB_ID, "name": "scratch-web", "image": "nginx:alpine",
-               "project": "", "service": ""}
+               "project": "", "service": "", "startedAt": 1794987840}
         self.assertEqual(ports.container_ports(DOCKER_INSPECT), [
             {"proto": "tcp", "port": 5432, "address": "0.0.0.0", "containerPort": 5432, "container": postgres},
             {"proto": "tcp", "port": 5432, "address": "::", "containerPort": 5432, "container": postgres},
@@ -180,9 +181,42 @@ class ContainerPortsTests(unittest.TestCase):
         ])
 
 
+class StartTimeTests(unittest.TestCase):
+    def test_docker_times_with_any_precision_and_zone(self):
+        self.assertEqual(ports.docker_time("2026-11-17T09:12:44.123456789Z"), 1794906764)
+        self.assertEqual(ports.docker_time("2026-11-17T09:12:44Z"), 1794906764)
+        self.assertEqual(ports.docker_time("2026-11-18T13:14:00+05:30"), 1794987840)
+
+    def test_unusable_docker_times_are_zero(self):
+        for text in (None, "", "yesterday", "0001-01-01T00:00:00Z", "2026-13-45T99:00:00Z",
+                     "2026-11-17T09:12:44.1Z; rm -rf /"):
+            self.assertEqual(ports.docker_time(text), 0, text)
+
+    def test_process_start_ticks_become_wall_clock_seconds(self):
+        # Booted at 1_794_900_000, started 227_621 ticks (2276 s at 100 Hz) later.
+        self.assertEqual(ports.started_at(227621, 1794900000, 100), 1794902276)
+
+    def test_unknown_parts_give_no_wall_clock_time(self):
+        self.assertEqual(ports.started_at(0, 1794900000, 100), 0)
+        self.assertEqual(ports.started_at(227621, 0, 100), 0)
+        self.assertEqual(ports.started_at(227621, 1794900000, 0), 0)
+
+    def test_boot_time_is_read_from_proc_stat(self):
+        with tempfile.TemporaryDirectory() as proc:
+            Path(proc, "stat").write_text("cpu  1 2 3 4\nintr 5\nbtime 1794900000\nprocesses 99\n")
+            self.assertEqual(ports.boot_time(proc), 1794900000)
+
+    def test_unreadable_boot_time_is_zero(self):
+        with tempfile.TemporaryDirectory() as proc:
+            self.assertEqual(ports.boot_time(proc), 0)
+            Path(proc, "stat").write_text("cpu  1 2 3 4\nbtime soon\n")
+            ports.boot_time.cache_clear()
+            self.assertEqual(ports.boot_time(proc), 0)
+
+
 # ------------------------------------------------------------------ grouping
 
-SELF = {"owned": True, "start": 227621, "command": "python3 -m http.server 42635", "cwd": "/home/alice/code/site"}
+SELF = {"owned": True, "start": 227621, "startedAt": 1794902276, "command": "python3 -m http.server 42635", "cwd": "/home/alice/code/site"}
 PROCESSES = {
     112443: SELF,
     4242: {"owned": False, "start": 900, "command": "/usr/bin/prometheus", "cwd": "/"},
@@ -224,7 +258,7 @@ class BuildListenersTests(unittest.TestCase):
             "proto": "tcp", "port": 42635, "addresses": ["0.0.0.0", "::"], "interfaces": [],
             "scope": "network", "url": "http://localhost:42635",
             "owner": {"kind": "process", "name": "python3", "pid": 112443, "owned": True,
-                      "start": 227621, "command": "python3 -m http.server 42635",
+                      "start": 227621, "startedAt": 1794902276, "command": "python3 -m http.server 42635",
                       "cwd": "/home/alice/code/site"},
             "actions": ["open", "copy", "terminate", "kill"],
         }])
@@ -377,7 +411,7 @@ class BuildListenersTests(unittest.TestCase):
     def test_process_that_exited_before_it_was_described_is_read_only(self):
         [listener] = build([sock("127.0.0.1", 5001, "tcp", ("ghost", 777))])
         self.assertEqual(listener["owner"], {"kind": "process", "name": "ghost", "pid": 777, "owned": False,
-                                             "start": 0, "command": "", "cwd": ""})
+                                             "start": 0, "startedAt": 0, "command": "", "cwd": ""})
         self.assertEqual(listener["actions"], ["open", "copy"])
 
     def test_ignored_ports_are_dropped(self):

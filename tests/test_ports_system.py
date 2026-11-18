@@ -73,6 +73,9 @@ class DescribeProcessTests(ChildProcessCase):
             self.assertIsNotNone(details)
             self.assertTrue(details["owned"])
             self.assertGreater(details["start"], 0)
+            # Just started, so its wall-clock start is now, to within the
+            # second boot_time and the tick rounding each lose.
+            self.assertLessEqual(abs(details["startedAt"] - time.time()), 5)
             self.assertIn("time.sleep(60)", details["command"])
             self.assertEqual(details["cwd"], os.path.realpath(workdir))
 

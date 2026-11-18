@@ -48,6 +48,9 @@ Listeners are grouped by owner:
 
 An IPv4 and IPv6 bind of the same port by the same owner is one row, not two.
 
+Hover a row for the rest: the full command line or image, how long ago the
+process or container started, and every address it is bound to.
+
 ### Reach
 
 Every row says how far its port reaches, from its bind addresses:

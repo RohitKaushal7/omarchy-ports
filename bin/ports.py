@@ -10,6 +10,8 @@ their target immediately before acting.
 from __future__ import annotations
 
 import argparse
+import datetime
+import functools
 import ipaddress
 import json
 import os
@@ -259,6 +261,28 @@ def parse_sockets(text: str, proto: str) -> list[dict]:
     return sockets
 
 
+# How `docker inspect` prints State.StartedAt: RFC 3339 with up to nine
+# fractional digits, which datetime cannot read as-is before Python 3.11.
+DOCKER_TIME = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)")
+
+
+def docker_time(text) -> int:
+    """"2026-11-17T09:12:44.123456789Z" -> seconds since the epoch, or 0 for
+    anything else, including docker's year-one "never started"."""
+    match = DOCKER_TIME.fullmatch(str(text or ""))
+    if not match:
+        return 0
+    zone = datetime.timezone.utc
+    if match[2] != "Z":
+        sign = 1 if match[2][0] == "+" else -1
+        zone = datetime.timezone(sign * datetime.timedelta(hours=int(match[2][1:3]), minutes=int(match[2][4:6])))
+    try:
+        moment = datetime.datetime.strptime(match[1], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=zone)
+    except ValueError:
+        return 0
+    return max(0, int(moment.timestamp()))
+
+
 def container_ports(inspected: list[dict]) -> list[dict]:
     """Host bindings published by running containers, from `docker inspect`.
     Exposed-but-unpublished ports come through as null and are skipped."""
@@ -274,6 +298,7 @@ def container_ports(inspected: list[dict]) -> list[dict]:
             "image": truncate(config.get("Image", "")),
             "project": truncate(labels.get("com.docker.compose.project", "")),
             "service": truncate(labels.get("com.docker.compose.service", "")),
+            "startedAt": docker_time((container.get("State") or {}).get("StartedAt")),
         }
         bindings_by_port = (container.get("NetworkSettings") or {}).get("Ports") or {}
         for spec, bindings in bindings_by_port.items():
@@ -305,6 +330,7 @@ def process_owner(name: str, pid: int, details: dict | None) -> dict:
         "pid": pid,
         "owned": bool(details.get("owned")),
         "start": int(details.get("start") or 0),
+        "startedAt": int(details.get("startedAt") or 0),
         "command": truncate(details.get("command", "")),
         "cwd": truncate(details.get("cwd", "")),
     }
@@ -500,10 +526,43 @@ def blank_on_error(read) -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=None)
+def boot_time(proc_root: str = "/proc") -> int:
+    """When the machine booted, in seconds since the epoch, from btime in
+    /proc/stat; 0 if it cannot be read."""
+    try:
+        for line in (Path(proc_root) / "stat").read_text().splitlines():
+            name, _, value = line.partition(" ")
+            if name == "btime" and value.strip().isdigit():
+                return int(value)
+    except OSError:
+        pass
+    return 0
+
+
+def started_at(start_ticks: int, booted: int, ticks_per_second: int) -> int:
+    """A /proc start time, in clock ticks since boot, as wall-clock seconds
+    since the epoch; 0 when any part is unknown."""
+    if start_ticks <= 0 or booted <= 0 or ticks_per_second <= 0:
+        return 0
+    return booted + start_ticks // ticks_per_second
+
+
+def clock_ticks() -> int:
+    try:
+        return int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError):
+        return 0
+
+
 def describe_process(pid: int, proc_root: str = "/proc") -> dict | None:
     """Owner, start time, command line and working directory of a pid, or
     None once it has exited. Another user's cwd is unreadable and comes back
-    blank; the rest of /proc/<pid> stays world-readable."""
+    blank; the rest of /proc/<pid> stays world-readable.
+
+    `start` is the kernel's, in clock ticks since boot: exact, and what a
+    signal is verified against. `startedAt` is the same moment on the wall
+    clock, to the second, for showing."""
     proc_dir = Path(proc_root) / str(pid)
     try:
         uid = proc_dir.stat().st_uid
@@ -513,6 +572,7 @@ def describe_process(pid: int, proc_root: str = "/proc") -> dict | None:
     return {
         "owned": uid == os.geteuid(),
         "start": start,
+        "startedAt": started_at(start, boot_time(proc_root), clock_ticks()),
         "command": blank_on_error(lambda: " ".join(
             part.decode(errors="replace")
             for part in (proc_dir / "cmdline").read_bytes().split(b"\0") if part)),

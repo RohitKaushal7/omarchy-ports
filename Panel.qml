@@ -102,6 +102,9 @@ Panel {
   property var warnings: []
   property string scanError: ""
   property bool scanned: false
+  // The helper's clock at the last scan, in seconds. Ages in the tooltips
+  // are measured from it, and through it they move on with every scan.
+  property int scannedAt: 0
   // The last listener list, as text. A refresh that finds the same sockets
   // leaves `listeners` untouched, so the rows are not rebuilt under the
   // pointer -- which would drop the hover, the tooltip and the cursor.
@@ -163,6 +166,7 @@ Panel {
       return
     }
     root.scanError = ""
+    root.scannedAt = Number.isInteger(payload.scannedAt) && payload.scannedAt > 0 ? payload.scannedAt : 0
     root.warnings = Array.isArray(payload.warnings) ? payload.warnings : []
     var next = JSON.stringify(payload.listeners)
     if (next !== root.listenersText) {
@@ -259,15 +263,30 @@ Panel {
     return "this machine only"
   }
 
+  // "Started 2 days ago", from a start time and the scan's clock, both in
+  // seconds since the epoch. Blank when either is unknown.
+  function startedAgo(startedAt, now) {
+    if (!(Number.isInteger(startedAt) && startedAt > 0 && now > 0)) return ""
+    var seconds = Math.max(0, now - startedAt)
+    var units = [[86400, "day"], [3600, "hour"], [60, "minute"]]
+    for (var i = 0; i < units.length; i++) {
+      var n = Math.floor(seconds / units[i][0])
+      if (n >= 1) return "Started " + n + " " + units[i][1] + (n === 1 ? "" : "s") + " ago"
+    }
+    return "Started just now"
+  }
+
   // The row carries a name and one line; everything else waits in here.
   function detail(l) {
     var o = l.owner || {}
     var lines = []
     if (o.kind === "process") {
       if (o.command) lines.push(o.command)
+      lines.push(root.startedAgo(o.startedAt, root.scannedAt))
       if (!o.owned) lines.push("Owned by another user, so it is read-only.")
     } else if (o.kind === "container") {
       lines.push(String(o.image || ""))
+      lines.push(root.startedAgo(o.startedAt, root.scannedAt))
       lines.push("Host :" + l.port + " → container :" + o.containerPort)
     } else {
       lines.push("Owned by root or another user, so the process is hidden.")
