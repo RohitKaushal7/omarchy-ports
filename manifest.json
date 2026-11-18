@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dev.reuk.ports",
   "name": "Ports",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "reuk",
   "license": "MIT",
   "description": "What is listening on this machine, who owns it, and how far it reaches.",
