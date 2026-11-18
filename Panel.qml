@@ -332,6 +332,15 @@ Panel {
     return text
   }
 
+  // The popup's content is built the first time the panel opens, not on
+  // every monitor at startup, and stays built after that. Until then these
+  // are null; the scan, the counts and the icon run without them.
+  readonly property Item keys: panel.loadedContent
+  readonly property Item listFlick: root.keys ? root.keys.listFlick : null
+  readonly property Item listItems: root.keys ? root.keys.listItems : null
+  readonly property Item searchField: root.keys ? root.keys.searchField : null
+  readonly property Item confirmDialog: root.keys ? root.keys.confirmDialog : null
+
   // ---------------------------------------------------------------- cursor
 
   // The cursor follows a listener, not a slot: a refresh that adds a row
@@ -363,9 +372,10 @@ Panel {
 
   // Only a keyboard move scrolls; a row under the mouse is already in view.
   function reveal(item) {
-    if (!root.cursorFromKeyboard || !item) return
+    var flick = root.listFlick
+    if (!root.cursorFromKeyboard || !item || !flick || !root.listItems) return
     var pad = Style.space(6)
-    var top = item.mapToItem(listColumn, 0, 0).y
+    var top = item.mapToItem(root.listItems, 0, 0).y
     var bottom = top + item.height
     var maxY = Math.max(0, flick.contentHeight - flick.height)
     if (top - pad < flick.contentY) flick.contentY = Math.max(0, top - pad)
@@ -404,7 +414,8 @@ Panel {
     } else if (!root.confirmActions) {
       root.pending = { listener: l, action: action }
       root.runPending()
-    } else {
+    } else if (root.confirmDialog) {
+      var confirm = root.confirmDialog
       root.pending = { listener: l, action: action }
       confirm.message = root.confirmMessage(l, action)
       confirm.confirmText = action === "stop" ? "Stop" : (action === "kill" ? "Kill" : "Terminate")
@@ -421,17 +432,19 @@ Panel {
     return "Terminate " + o.name + " (PID " + o.pid + ") on :" + l.port + "?"
   }
 
-  function cancelPending() {
-    confirm.opened = false
+  function dismissConfirm() {
+    if (root.confirmDialog) root.confirmDialog.opened = false
     root.pending = null
-    keyCatcher.forceActiveFocus()
+    if (root.keys) root.keys.forceActiveFocus()
+  }
+
+  function cancelPending() {
+    root.dismissConfirm()
   }
 
   function runPending() {
     var p = root.pending
-    confirm.opened = false
-    root.pending = null
-    keyCatcher.forceActiveFocus()
+    root.dismissConfirm()
     if (!p || actor.running) return
     var l = p.listener
     var o = l.owner
@@ -498,11 +511,11 @@ Panel {
       root.cursorActive = false
       root.cursorKey = ""
       root.refresh()
-      if (flick) flick.contentY = 0
+      if (root.listFlick) root.listFlick.contentY = 0
     } else {
-      confirm.opened = false
+      if (root.confirmDialog) root.confirmDialog.opened = false
       root.pending = null
-      search.text = ""
+      if (root.searchField) root.searchField.text = ""
     }
   }
 
@@ -598,12 +611,18 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(440))
-    contentHeight: panel.fittedContentHeight(layout.implicitHeight, Style.space(680))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(680))
 
-    PanelKeyCatcher {
+    content: PanelKeyCatcher {
       id: keyCatcher
+      // What root-level code reaches in for, through panel.loadedContent.
+      property alias listFlick: flick
+      property alias listItems: listColumn
+      property alias searchField: search
+      property alias confirmDialog: confirm
+      implicitHeight: layout.implicitHeight
       anchors.fill: parent
       blocked: search.activeFocus && !confirm.opened
 
