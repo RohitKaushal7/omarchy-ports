@@ -662,14 +662,16 @@ Panel {
           fontFamily: root.fontFamily
 
           iconComponent: Text {
+            textFormat: Text.PlainText
             text: root.glyphs.radar
             color: root.alerting ? root.urgent : root.ink
             font.family: root.fontFamily
             font.pixelSize: Style.font.display
-            Behavior on color { ColorAnimation { duration: 240 } }
+            Behavior on color { ColorAnimation { duration: Style.duration(240) } }
           }
 
           trailingControl: Text {
+            textFormat: Text.PlainText
             text: root.scanned ? String(root.shown.length) : ""
             color: root.ink
             font.family: root.fontFamily
@@ -711,6 +713,7 @@ Panel {
           radius: Style.cornerRadius
 
           Text {
+            textFormat: Text.PlainText
             id: errorText
             anchors.left: parent.left
             anchors.right: parent.right
@@ -726,6 +729,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: text !== ""
           text: root.notice !== ""
@@ -738,6 +742,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: root.scanError === "" && root.ordered.length === 0
           topPadding: Style.space(8)
@@ -780,6 +785,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: root.ordered.length > 0
           horizontalAlignment: Text.AlignHCenter
@@ -852,6 +858,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: headValue
       anchors.right: parent.right
       anchors.rightMargin: Style.space(8)
@@ -908,6 +915,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: portText
       anchors.left: reachDot.right
       anchors.leftMargin: Style.space(8)
@@ -930,6 +938,7 @@ Panel {
       spacing: Style.space(2)
 
       Text {
+        textFormat: Text.PlainText
         width: parent.width
         text: row.listener ? root.title(row.listener) : ""
         color: row.guessed ? root.dim : root.ink
@@ -940,6 +949,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         width: parent.width
         visible: text !== ""
         text: row.listener ? root.meta(row.listener) : ""
@@ -959,6 +969,7 @@ Panel {
       height: Style.space(24)
 
       Text {
+        textFormat: Text.PlainText
         anchors.right: parent.right
         anchors.rightMargin: Style.space(6)
         anchors.verticalCenter: parent.verticalCenter
