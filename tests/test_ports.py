@@ -112,6 +112,11 @@ class ClassifyTests(unittest.TestCase):
         for address in ("100.64.0.1", "100.90.0.14", "100.127.255.255", "fd7a:115c:a1e0::6c01:74c1"):
             self.assertEqual(ports.classify(address), "overlay", address)
 
+    def test_v4_mapped_addresses_classify_as_their_v4(self):
+        self.assertEqual(ports.classify("::ffff:127.0.0.1"), "local")
+        self.assertEqual(ports.classify("::ffff:100.90.0.14"), "overlay")
+        self.assertEqual(ports.listener_url("tcp", 80, ["::ffff:192.168.1.5"]), "http://192.168.1.5:80")
+
     def test_wildcards_and_everything_else_are_network(self):
         for address in ("0.0.0.0", "::", "*", "192.168.1.8", "172.17.0.1",
                         "100.63.255.255", "100.128.0.0", "fd00::1", "example.local"):
@@ -223,6 +228,8 @@ PROCESSES = {
     5150: {"owned": True, "start": 0, "command": "", "cwd": ""},
     907: {"owned": True, "start": 50, "command": "nginx: master process", "cwd": "/"},
     911: {"owned": True, "start": 51, "command": "nginx: worker process", "cwd": "/"},
+    1200: {"owned": True, "start": 10, "command": "/usr/lib/systemd/systemd --user", "cwd": "/"},
+    3300: {"owned": True, "start": 90, "command": "/usr/bin/devserver", "cwd": "/home/alice"},
 }
 
 
@@ -273,6 +280,16 @@ class BuildListenersTests(unittest.TestCase):
         [listener] = build([sock("0.0.0.0", 8080, "tcp", ("nginx", 911), ("nginx", 907))])
         self.assertEqual(listener["owner"]["pid"], 907)
         self.assertEqual(listener["owner"]["command"], "nginx: master process")
+
+    def test_socket_activation_belongs_to_the_service_not_the_manager(self):
+        # systemd --user keeps the activated socket and has the lower pid.
+        [listener] = build([sock("127.0.0.1", 9000, "tcp", ("systemd", 1200), ("devserver", 3300))])
+        self.assertEqual(listener["owner"]["pid"], 3300)
+
+    def test_a_socket_only_the_manager_holds_is_never_signalled(self):
+        [listener] = build([sock("127.0.0.1", 9000, "tcp", ("systemd", 1200))])
+        self.assertEqual(listener["owner"]["name"], "systemd")
+        self.assertFalse(listener["owner"]["owned"], "the user manager must stay read-only")
 
     def test_published_container_claims_the_anonymous_host_sockets(self):
         listeners = build([sock("0.0.0.0", 6379), sock("::", 6379)],

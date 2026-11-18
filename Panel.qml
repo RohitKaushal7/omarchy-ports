@@ -129,7 +129,7 @@ Panel {
   }
 
   function scanCommand() {
-    var command = ["/usr/bin/python3", "-I", root.helper, "scan", "--ignore", root.ignoredPorts]
+    var command = ["/usr/bin/python3", "-I", root.helper, "scan", "--ignore=" + root.ignoredPorts]
     if (root.includeUdp) command.push("--udp")
     if (!root.includeDocker) command.push("--no-docker")
     return command

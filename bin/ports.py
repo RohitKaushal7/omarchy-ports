@@ -25,6 +25,10 @@ import time
 from pathlib import Path
 
 WILDCARDS = {"0.0.0.0", "::", "*"}
+# Service managers hand sockets to the services they start and keep a copy
+# (socket activation). They hold the socket but are never the server, and
+# signalling the user manager would take the session down with it.
+SERVICE_MANAGERS = {"systemd", "init"}
 
 # Tailscale and NetBird both hand out addresses from the CGNAT block, and
 # Tailscale's IPv6 sits under its own ULA prefix. A socket bound only there is
@@ -213,6 +217,8 @@ def classify(address: str) -> str:
         ip = ipaddress.ip_address(address.split("%", 1)[0])
     except ValueError:
         return "network"
+    if ip.version == 6 and ip.ipv4_mapped:  # ::ffff:127.0.0.1 is loopback
+        ip = ip.ipv4_mapped
     if ip.is_loopback:
         return "local"
     if any(ip in network for network in OVERLAY_NETWORKS):
@@ -355,7 +361,13 @@ def listener_url(proto: str, port: int, addresses: list[str]) -> str | None:
         host = "localhost"
     else:
         host = addresses[0]
-        if ":" in host:
+        try:
+            mapped = ipaddress.ip_address(host).ipv4_mapped if ":" in host else None
+        except ValueError:
+            mapped = None
+        if mapped:
+            host = str(mapped)  # [::ffff:192.168.1.5] → 192.168.1.5, which Open accepts
+        elif ":" in host:
             host = f"[{host}]"
     return f"http://{host}:{port}"
 
@@ -384,14 +396,18 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
         if sock["port"] in ignored:
             continue
         # Forked servers share one socket across every worker; the lowest pid
-        # is the one that opened it, and the one worth signalling.
-        pids = sorted(process["pid"] for process in sock["processes"])
-        owner_pid = pids[0] if pids else None
+        # is the one that opened it, and the one worth signalling. A service
+        # manager that keeps an activated socket open is passed over for the
+        # service it started.
+        holders = sorted((process["pid"], process["name"]) for process in sock["processes"])
+        servers = [h for h in holders if h[1] not in SERVICE_MANAGERS] or holders
+        owner_pid, owner_name = servers[0] if servers else (None, "")
         entry = group((sock["proto"], sock["port"], "pid", owner_pid), sock["proto"], sock["port"])
         add_address(entry, sock["address"], sock.get("interface", ""))
         if owner_pid is not None and entry["owner"] is None:
-            name = next(p["name"] for p in sock["processes"] if p["pid"] == owner_pid)
-            entry["owner"] = process_owner(name, owner_pid, describe(owner_pid))
+            entry["owner"] = process_owner(owner_name, owner_pid, describe(owner_pid))
+            if owner_name in SERVICE_MANAGERS:
+                entry["owner"]["owned"] = False  # shown, never signalled
 
     for binding in containers:
         proto, port = binding["proto"], binding["port"]
@@ -580,6 +596,13 @@ def describe_process(pid: int, proc_root: str = "/proc") -> dict | None:
     }
 
 
+def read_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
 def signal_process(pid: int, start: int, signal_name: str) -> None:
     """SIGTERM or SIGKILL a pid, but only while it is still the process the
     panel listed: owned by this user and started at the same instant."""
@@ -604,6 +627,8 @@ def signal_process(pid: int, start: int, signal_name: str) -> None:
             raise ActionError(f"PID {pid} has already exited")
         if not details["owned"]:
             raise ActionError(f"PID {pid} belongs to another user")
+        if read_comm(pid) in SERVICE_MANAGERS:
+            raise ActionError(f"PID {pid} is a service manager; stop the service instead")
         if details["start"] != start:
             raise ActionError(f"PID {pid} is a different process now. Refresh and try again.")
         try:
