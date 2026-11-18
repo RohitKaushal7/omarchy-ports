@@ -71,6 +71,11 @@ About a hundred common service ports are known; development-server ports are
 deliberately left out. A port published by a container is attributed to the
 container instead.
 
+A socket bound to a VPN's own interface is named after that VPN instead of its
+port, since that is what the VPN's daemon does with its sockets: `tailscale*`
+is `Tailscale?`, `wt*` `NetBird?`, `zt*` `ZeroTier?` and `wg*` `WireGuard?`.
+So `hiddenNames "tailscale"` hides tailscaled's random-port listeners too.
+
 ## Keyboard
 
 | Key | Action |
@@ -106,7 +111,7 @@ panel picks up a change as soon as it is saved.
 | `ignoredPorts` | `"53,631,5353"` | Ports and ranges to leave out, e.g. `"53,631,8000-8010"`. The default hides DNS, CUPS and mDNS. |
 | `hiddenNames` | `""` | Comma-separated names to leave out, matched without regard to case against process names, container names, Compose services and guessed service names, e.g. `"spotify,kdeconnectd"`. |
 | `showSystem` | `true` | List sockets owned by root or other users. `false` shows only your processes and containers. |
-| `showGuesses` | `true` | Name unnamed sockets after the service that usually uses the port, as `Redis?`. `false` shows them as `Unknown`. |
+| `showGuesses` | `true` | Name unnamed sockets after the service that usually uses the port, as `Redis?`, or the VPN whose interface they are bound to, as `Tailscale?`. `false` shows them as `Unknown`. |
 | `includeDocker` | `true` | Attribute published ports to their containers and allow stopping them. `false` never runs `docker`. |
 | `includeUdp` | `false` | List UDP sockets as well as TCP listeners. |
 | `confirmActions` | `true` | Ask before terminating, killing or stopping. `false` acts on the first key press or click. |

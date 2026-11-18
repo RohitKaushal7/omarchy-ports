@@ -78,7 +78,7 @@
         "type": "boolean",
         "label": "Guess unnamed services",
         "defaultValue": true,
-        "description": "Name sockets with a hidden owner after the service that usually uses the port."
+        "description": "Name sockets with a hidden owner after the service that usually uses the port, or the VPN whose interface they are bound to."
       },
       {
         "key": "includeDocker",

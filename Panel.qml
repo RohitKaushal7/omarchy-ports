@@ -207,7 +207,7 @@ Panel {
     if (needle === "") return rows
     return rows.filter(function(l) {
       var o = l.owner || {}
-      var fields = [l.port, l.proto, (l.addresses || []).join(" "), o.name, root.showGuesses ? o.guess : "", o.pid,
+      var fields = [l.port, l.proto, (l.addresses || []).join(" "), (l.interfaces || []).join(" "), o.name, root.showGuesses ? o.guess : "", o.pid,
                     o.command, o.cwd, o.image, o.project, o.service]
       return fields.filter(function(v) { return v !== undefined && v !== null && v !== "" })
         .join(" ").toLowerCase().indexOf(needle) !== -1
@@ -271,9 +271,14 @@ Panel {
       lines.push("Host :" + l.port + " → container :" + o.containerPort)
     } else {
       lines.push("Owned by root or another user, so the process is hidden.")
-      if (root.showGuesses && o.guess) lines.push("Port " + l.port + " is usually " + o.guess + ".")
+      if (root.showGuesses && o.guess) {
+        lines.push(o.guessFrom === "interface"
+          ? "Bound to " + (l.interfaces || []).join(", ") + ", so probably " + o.guess + "'s own."
+          : "Port " + l.port + " is usually " + o.guess + ".")
+      }
     }
-    lines.push((l.addresses || []).join(", ") + "  ·  " + root.reachSentence(l.scope))
+    var bound = (l.interfaces || []).length > 0 ? " on " + l.interfaces.join(", ") : ""
+    lines.push((l.addresses || []).join(", ") + bound + "  ·  " + root.reachSentence(l.scope))
     return lines.filter(function(s) { return s !== "" }).join("\n")
   }
 

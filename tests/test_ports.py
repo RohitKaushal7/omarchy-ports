@@ -120,45 +120,46 @@ class ClassifyTests(unittest.TestCase):
 class ParseSocketsTests(unittest.TestCase):
     def test_tcp_rows(self):
         self.assertEqual(ports.parse_sockets(SS_TCP, "tcp"), [
-            {"proto": "tcp", "address": "0.0.0.0", "port": 6379, "processes": []},
-            {"proto": "tcp", "address": "127.0.0.53", "port": 53, "processes": []},
-            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65009, "processes": []},
-            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65010, "processes": []},
-            {"proto": "tcp", "address": "100.90.0.14", "port": 57203, "processes": []},
-            {"proto": "tcp", "address": "::1", "port": 51725,
+            {"proto": "tcp", "address": "0.0.0.0", "port": 6379, "interface": "", "processes": []},
+            {"proto": "tcp", "address": "127.0.0.53", "port": 53, "interface": "lo", "processes": []},
+            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65009, "interface": "", "processes": []},
+            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65010, "interface": "tailscale0", "processes": []},
+            {"proto": "tcp", "address": "100.90.0.14", "port": 57203, "interface": "tailscale0", "processes": []},
+            {"proto": "tcp", "address": "::1", "port": 51725, "interface": "",
              "processes": [{"name": "python3", "pid": 112443}]},
-            {"proto": "tcp", "address": "0.0.0.0", "port": 8080,
+            {"proto": "tcp", "address": "0.0.0.0", "port": 8080, "interface": "",
              "processes": [{"name": "nginx", "pid": 911}, {"name": "nginx", "pid": 907}]},
-            {"proto": "tcp", "address": "127.0.0.1", "port": 3000,
+            {"proto": "tcp", "address": "127.0.0.1", "port": 3000, "interface": "",
              "processes": [{"name": "Web Content", "pid": 5150}]},
         ])
 
     def test_udp_rows_including_star_address(self):
         self.assertEqual(ports.parse_sockets(SS_UDP, "udp"), [
-            {"proto": "udp", "address": "127.0.0.1", "port": 57983,
+            {"proto": "udp", "address": "127.0.0.1", "port": 57983, "interface": "",
              "processes": [{"name": "python3", "pid": 112443}]},
-            {"proto": "udp", "address": "*", "port": 5353, "processes": []},
-            {"proto": "udp", "address": "fe80::57c3:2a98:8b6a:e7ed", "port": 546, "processes": []},
+            {"proto": "udp", "address": "*", "port": 5353, "interface": "", "processes": []},
+            {"proto": "udp", "address": "fe80::57c3:2a98:8b6a:e7ed", "port": 546, "interface": "wlo1", "processes": []},
         ])
 
 
 class SplitEndpointTests(unittest.TestCase):
     def test_plain_addresses(self):
-        self.assertEqual(ports.split_endpoint("0.0.0.0:22"), ("0.0.0.0", 22))
-        self.assertEqual(ports.split_endpoint("[::1]:631"), ("::1", 631))
-        self.assertEqual(ports.split_endpoint("*:5353"), ("*", 5353))
+        self.assertEqual(ports.split_endpoint("0.0.0.0:22"), ("0.0.0.0", 22, ""))
+        self.assertEqual(ports.split_endpoint("[::1]:631"), ("::1", 631, ""))
+        self.assertEqual(ports.split_endpoint("*:5353"), ("*", 5353, ""))
 
-    def test_interface_suffix_is_removed(self):
-        self.assertEqual(ports.split_endpoint("127.0.0.53%lo:53"), ("127.0.0.53", 53))
-        self.assertEqual(ports.split_endpoint("100.90.0.14%tailscale0:57203"), ("100.90.0.14", 57203))
+    def test_interface_suffix_is_split_off(self):
+        self.assertEqual(ports.split_endpoint("127.0.0.53%lo:53"), ("127.0.0.53", 53, "lo"))
+        self.assertEqual(ports.split_endpoint("100.90.0.14%tailscale0:57203"),
+                         ("100.90.0.14", 57203, "tailscale0"))
 
-    def test_interface_suffix_after_ipv6_brackets_is_removed_with_them(self):
+    def test_interface_suffix_after_ipv6_brackets_is_split_off_first(self):
         # ss puts the interface outside the brackets, so the brackets only
         # close the host once it is gone.
         self.assertEqual(ports.split_endpoint("[fe80::57c3:2a98:8b6a:e7ed]%wlo1:546"),
-                         ("fe80::57c3:2a98:8b6a:e7ed", 546))
+                         ("fe80::57c3:2a98:8b6a:e7ed", 546, "wlo1"))
         self.assertEqual(ports.split_endpoint("[fd7a:115c:a1e0::6c01:74c1]%tailscale0:65009"),
-                         ("fd7a:115c:a1e0::6c01:74c1", 65009))
+                         ("fd7a:115c:a1e0::6c01:74c1", 65009, "tailscale0"))
 
     def test_not_an_endpoint(self):
         for text in ("", "nonsense", "1.2.3.4:", "1.2.3.4:http"):
@@ -195,8 +196,8 @@ def describe(pid):
     return PROCESSES.get(pid)
 
 
-def sock(address, port, proto="tcp", *procs):
-    return {"proto": proto, "address": address, "port": port,
+def sock(address, port, proto="tcp", *procs, interface=""):
+    return {"proto": proto, "address": address, "port": port, "interface": interface,
             "processes": [{"name": name, "pid": pid} for name, pid in procs]}
 
 
@@ -220,7 +221,7 @@ class BuildListenersTests(unittest.TestCase):
         listeners = build([sock("0.0.0.0", 42635, "tcp", ("python3", 112443)),
                            sock("::", 42635, "tcp", ("python3", 112443))])
         self.assertEqual([without_key(l) for l in listeners], [{
-            "proto": "tcp", "port": 42635, "addresses": ["0.0.0.0", "::"],
+            "proto": "tcp", "port": 42635, "addresses": ["0.0.0.0", "::"], "interfaces": [],
             "scope": "network", "url": "http://localhost:42635",
             "owner": {"kind": "process", "name": "python3", "pid": 112443, "owned": True,
                       "start": 227621, "command": "python3 -m http.server 42635",
@@ -243,7 +244,7 @@ class BuildListenersTests(unittest.TestCase):
         listeners = build([sock("0.0.0.0", 6379), sock("::", 6379)],
                           [published("0.0.0.0", 6379), published("::", 6379)])
         self.assertEqual([without_key(l) for l in listeners], [{
-            "proto": "tcp", "port": 6379, "addresses": ["0.0.0.0", "::"],
+            "proto": "tcp", "port": 6379, "addresses": ["0.0.0.0", "::"], "interfaces": [],
             "scope": "network", "url": "http://localhost:6379",
             "owner": {"kind": "container", "name": "redis", "id": REDIS_ID, "image": "redis:7",
                       "project": "shop", "service": "redis", "containerPort": 6379},
@@ -255,7 +256,7 @@ class BuildListenersTests(unittest.TestCase):
                                          image="nginx:alpine", container_port=80,
                                          project="", service="")])
         self.assertEqual([without_key(l) for l in listeners], [{
-            "proto": "tcp", "port": 8088, "addresses": ["127.0.0.1"],
+            "proto": "tcp", "port": 8088, "addresses": ["127.0.0.1"], "interfaces": [],
             "scope": "local", "url": "http://localhost:8088",
             "owner": {"kind": "container", "name": "scratch-web", "id": WEB_ID, "image": "nginx:alpine",
                       "project": "", "service": "", "containerPort": 80},
@@ -264,7 +265,7 @@ class BuildListenersTests(unittest.TestCase):
 
     def test_unknown_owner_on_a_well_known_port_gets_a_guess(self):
         [listener] = build([sock("0.0.0.0", 8096)])
-        self.assertEqual(listener["owner"], {"kind": "unknown", "guess": "Jellyfin"})
+        self.assertEqual(listener["owner"], {"kind": "unknown", "guess": "Jellyfin", "guessFrom": "port"})
         self.assertEqual(listener["actions"], ["open", "copy"])
 
     def test_hidden_sockets_on_popular_service_ports_get_guesses(self):
@@ -285,12 +286,51 @@ class BuildListenersTests(unittest.TestCase):
         }
         for port, guess in cases.items():
             [listener] = build([sock("0.0.0.0", port)])
-            self.assertEqual(listener["owner"], {"kind": "unknown", "guess": guess}, port)
+            self.assertEqual(listener["owner"], {"kind": "unknown", "guess": guess, "guessFrom": "port"}, port)
 
     def test_unknown_owner_on_an_unlisted_port_has_no_guess(self):
         [listener] = build([sock("127.0.0.1", 39033)])
-        self.assertEqual(listener["owner"], {"kind": "unknown", "guess": None})
+        self.assertEqual(listener["owner"], {"kind": "unknown", "guess": None, "guessFrom": None})
         self.assertEqual(listener["scope"], "local")
+
+    def test_socket_bound_to_a_vpn_interface_is_guessed_from_it(self):
+        cases = {
+            "tailscale0": "Tailscale",
+            "wt0": "NetBird",
+            "ztc3qwerty": "ZeroTier",
+            "wg0": "WireGuard",
+            "wg-home": "WireGuard",
+        }
+        for interface, guess in cases.items():
+            [listener] = build([sock("100.90.0.14", 57203, interface=interface)])
+            self.assertEqual(listener["owner"], {"kind": "unknown", "guess": guess, "guessFrom": "interface"},
+                             interface)
+            self.assertEqual(listener["interfaces"], [interface])
+
+    def test_tailscaled_random_port_sockets_are_guessed_as_tailscale(self):
+        listeners = build(ports.parse_sockets(SS_TCP, "tcp"))
+        by_port = {l["port"]: l for l in listeners}
+        for port in (57203, 65010):
+            self.assertEqual(by_port[port]["owner"]["guess"], "Tailscale", port)
+            self.assertEqual(by_port[port]["scope"], "overlay", port)
+        # Unscoped, the same address says nothing about who opened it.
+        self.assertIsNone(by_port[65009]["owner"]["guess"])
+
+    def test_vpn_interface_beats_the_port_guess(self):
+        [listener] = build([sock("100.90.0.14", 8096, interface="tailscale0")])
+        self.assertEqual(listener["owner"]["guess"], "Tailscale")
+
+    def test_other_interfaces_leave_the_port_guess(self):
+        [loopback] = build([sock("127.0.0.53", 53, interface="lo")])
+        self.assertEqual(loopback["owner"], {"kind": "unknown", "guess": "DNS", "guessFrom": "port"})
+        self.assertEqual(loopback["interfaces"], ["lo"])
+        [dhcp] = build([sock("fe80::57c3:2a98:8b6a:e7ed", 546, "udp", interface="wlo1")])
+        self.assertIsNone(dhcp["owner"]["guess"])
+
+    def test_named_process_on_a_vpn_interface_keeps_its_name(self):
+        [listener] = build([sock("100.90.0.14", 4000, "tcp", ("python3", 112443), interface="tailscale0")])
+        self.assertEqual(listener["owner"]["kind"], "process")
+        self.assertEqual(listener["owner"]["name"], "python3")
 
     def test_real_process_name_beats_the_port_guess(self):
         [listener] = build([sock("0.0.0.0", 8096, "tcp", ("python3", 112443))])

@@ -146,6 +146,18 @@ WELL_KNOWN = {
     27017: "MongoDB",
 }
 
+# Who usually owns a socket bound to an interface (ss prints it as
+# address%iface), by the interface's name. Ordinary services listen on an
+# address, not a device; binding to the VPN's own device is what its daemon
+# does for its own sockets, such as the random high ports tailscaled opens on
+# tailscale0. Like WELL_KNOWN, a guess: shown as one, never as the owner.
+INTERFACE_OWNERS = (
+    (re.compile(r"tailscale\d*"), "Tailscale"),
+    (re.compile(r"wt\d+"), "NetBird"),
+    (re.compile(r"zt\w+"), "ZeroTier"),
+    (re.compile(r"wg[\w.-]*"), "WireGuard"),
+)
+
 SCOPE_RANK = {"local": 0, "overlay": 1, "network": 2}
 
 # Bounds on everything the panel reads. Command lines, paths and image names
@@ -206,17 +218,27 @@ def classify(address: str) -> str:
     return "network"
 
 
-def split_endpoint(text: str) -> tuple[str, int] | None:
+def split_endpoint(text: str) -> tuple[str, int, str] | None:
+    """"[fe80::1]%wlo1:546" -> ("fe80::1", 546, "wlo1"). The interface is
+    blank unless the socket is bound to one."""
     host, colon, port = text.rpartition(":")
     if not colon or not port.isdigit():
         return None
     # ss appends the interface to a socket bound to one (127.0.0.53%lo), and
     # for IPv6 it goes outside the brackets ([fe80::1]%wlo1), so it has to
     # come off before the brackets can.
-    host = host.split("%", 1)[0]
+    host, _, interface = host.partition("%")
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
-    return host, int(port)
+    return host, int(port), truncate(interface, 64)
+
+
+def interface_owner(interfaces: list[str]) -> str | None:
+    for interface in interfaces:
+        for pattern, name in INTERFACE_OWNERS:
+            if pattern.fullmatch(interface):
+                return name
+    return None
 
 
 def parse_sockets(text: str, proto: str) -> list[dict]:
@@ -230,9 +252,10 @@ def parse_sockets(text: str, proto: str) -> list[dict]:
         endpoint = split_endpoint(fields[3])
         if endpoint is None:
             continue
-        address, port = endpoint
+        address, port, interface = endpoint
         processes = [{"name": name, "pid": int(pid)} for name, pid in USERS_ENTRY.findall(line)]
-        sockets.append({"proto": proto, "address": address, "port": port, "processes": processes})
+        sockets.append({"proto": proto, "address": address, "port": port, "interface": interface,
+                        "processes": processes})
     return sockets
 
 
@@ -287,6 +310,17 @@ def process_owner(name: str, pid: int, details: dict | None) -> dict:
     }
 
 
+def unknown_owner(port: int, interfaces: list[str]) -> dict:
+    """An owner ss could not name, with a guess at who it is. A socket bound
+    to a VPN's device is that VPN's own before it is whatever usually sits on
+    its port: tailscaled's random port can land on a well-known one."""
+    by_interface = interface_owner(interfaces)
+    if by_interface:
+        return {"kind": "unknown", "guess": by_interface, "guessFrom": "interface"}
+    by_port = WELL_KNOWN.get(port)
+    return {"kind": "unknown", "guess": by_port, "guessFrom": "port" if by_port else None}
+
+
 def listener_url(proto: str, port: int, addresses: list[str]) -> str | None:
     if proto != "tcp":
         return None
@@ -311,12 +345,14 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
 
     def group(key: tuple, proto: str, port: int) -> dict:
         if key not in groups:
-            groups[key] = {"proto": proto, "port": port, "addresses": [], "owner": None}
+            groups[key] = {"proto": proto, "port": port, "addresses": [], "interfaces": [], "owner": None}
         return groups[key]
 
-    def add_address(entry: dict, address: str) -> None:
+    def add_address(entry: dict, address: str, interface: str = "") -> None:
         if address not in entry["addresses"]:
             entry["addresses"].append(address)
+        if interface and interface not in entry["interfaces"]:
+            entry["interfaces"].append(interface)
 
     for sock in sockets:
         if sock["port"] in ignored:
@@ -326,7 +362,7 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
         pids = sorted(process["pid"] for process in sock["processes"])
         owner_pid = pids[0] if pids else None
         entry = group((sock["proto"], sock["port"], "pid", owner_pid), sock["proto"], sock["port"])
-        add_address(entry, sock["address"])
+        add_address(entry, sock["address"], sock.get("interface", ""))
         if owner_pid is not None and entry["owner"] is None:
             name = next(p["name"] for p in sock["processes"] if p["pid"] == owner_pid)
             entry["owner"] = process_owner(name, owner_pid, describe(owner_pid))
@@ -344,13 +380,17 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
         if entry is None:
             entry = group(key, proto, port)
             entry["owner"] = {"kind": "container", **container, "containerPort": binding["containerPort"]}
-        for address in (anonymous or {}).get("addresses", []):
-            add_address(entry, address)
+        if anonymous:
+            for address in anonymous["addresses"]:
+                add_address(entry, address)
+            for interface in anonymous["interfaces"]:
+                if interface not in entry["interfaces"]:
+                    entry["interfaces"].append(interface)
         add_address(entry, binding["address"])
 
     listeners = []
     for key, entry in groups.items():
-        owner = entry["owner"] or {"kind": "unknown", "guess": WELL_KNOWN.get(entry["port"])}
+        owner = entry["owner"] or unknown_owner(entry["port"], entry["interfaces"])
         url = listener_url(entry["proto"], entry["port"], entry["addresses"])
         actions = ["open", "copy"] if url else []
         if owner["kind"] == "container":
@@ -362,6 +402,7 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
             "proto": entry["proto"],
             "port": entry["port"],
             "addresses": entry["addresses"],
+            "interfaces": entry["interfaces"],
             "scope": max((classify(a) for a in entry["addresses"]), key=SCOPE_RANK.__getitem__),
             "url": url,
             "owner": owner,
