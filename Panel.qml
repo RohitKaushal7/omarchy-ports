@@ -20,6 +20,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "lib"
+import "lib/dockerHost.js" as DockerHost
 
 Panel {
   id: root
@@ -72,13 +73,12 @@ Panel {
   // manager's shim would otherwise decide what runs), no PYTHON* variables or
   // user site directory apply, and ss and docker resolve from /usr/bin and
   // /bin only. DOCKER_HOST is the one variable passed through, for rootless
-  // Docker.
-  readonly property var helperEnvironment: {
-    var environment = { PATH: "/usr/bin:/bin", LC_ALL: "C" }
-    var dockerHost = Quickshell.env("DOCKER_HOST")
-    if (dockerHost) environment.DOCKER_HOST = String(dockerHost)
-    return environment
-  }
+  // Docker, and only while it is a local socket: Docker on another machine is
+  // not scanned at all, and the panel says so.
+  readonly property string dockerHost: String(Quickshell.env("DOCKER_HOST") || "")
+  readonly property bool dockerIsLocal: DockerHost.isLocal(root.dockerHost)
+  readonly property string dockerNote: root.includeDocker && !root.dockerIsLocal ? DockerHost.skippedNote : ""
+  readonly property var helperEnvironment: DockerHost.helperEnvironment(root.dockerHost)
 
   // The helper bounds its own output well below this and times out its own
   // children; these only catch the helper itself misbehaving. The deadlines
@@ -131,7 +131,7 @@ Panel {
   function scanCommand() {
     var command = ["/usr/bin/python3", "-I", root.helper, "scan", "--ignore=" + root.ignoredPorts]
     if (root.includeUdp) command.push("--udp")
-    if (!root.includeDocker) command.push("--no-docker")
+    if (!root.includeDocker || !root.dockerIsLocal) command.push("--no-docker")
     return command
   }
 
@@ -497,6 +497,12 @@ Panel {
     }
   }
 
+  // The one line under the filter: what the last action did, else the scan's
+  // first warning, else why Docker was skipped.
+  readonly property string statusLine: root.notice !== ""
+    ? root.notice
+    : (root.warnings.length > 0 ? String(root.warnings[0]) : root.dockerNote)
+
   function say(text, isError) {
     root.notice = text
     root.noticeIsError = isError
@@ -752,9 +758,7 @@ Panel {
           textFormat: Text.PlainText
           width: parent.width
           visible: text !== ""
-          text: root.notice !== ""
-            ? root.notice
-            : (root.warnings.length > 0 ? String(root.warnings[0]) : "")
+          text: root.statusLine
           color: root.notice !== "" && root.noticeIsError ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

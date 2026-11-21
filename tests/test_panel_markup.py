@@ -10,10 +10,14 @@ PlainText; only the plugin's own Text items are checked.
 """
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "bin"))
+
+import ports  # noqa: E402
 SOURCES = sorted([ROOT / "Panel.qml", *(ROOT / "lib").glob("*.qml")])
 
 
@@ -60,6 +64,12 @@ class MotionTests(unittest.TestCase):
                 for value in re.findall(r"\bduration:\s*([^\s;}]+)", text):
                     self.assertTrue(value.startswith("Style.duration("),
                                     f"{path.name}:{number} bare duration {value}")
+
+
+class DockerNoteTests(unittest.TestCase):
+    def test_the_panel_and_the_helper_give_the_same_note(self):
+        source = (ROOT / "lib" / "dockerHost.js").read_text()
+        self.assertIn(f'var skippedNote = "{ports.REMOTE_DOCKER}"', source)
 
 
 if __name__ == "__main__":

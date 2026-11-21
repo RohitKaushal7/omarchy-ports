@@ -147,7 +147,12 @@ Everything runs as your user, with no elevated privileges.
 
 - The panel starts one helper, `bin/ports.py`, as `/usr/bin/python3 -I` with
   an emptied environment: `PATH=/usr/bin:/bin` and `LC_ALL=C`, plus
-  `DOCKER_HOST` when it is set. No shell is involved at any step.
+  `DOCKER_HOST` when it is a `unix://` socket (rootless Docker). No shell is
+  involved at any step.
+- Only Docker on this machine is scanned. With `DOCKER_HOST` set to anything
+  but a `unix://` socket — `tcp://`, `ssh://` — Docker is skipped and the
+  panel says so, and `docker` always runs with `DOCKER_CONTEXT=default`, so a
+  context chosen with `docker context use` cannot point it elsewhere.
 - The helper reads `ss` and `/proc`, and runs `docker ps` and `docker inspect`
   when Docker support is on. It makes no network requests.
 - Output from `ss` and `docker` is read up to 4 MiB and within a deadline —
@@ -174,6 +179,7 @@ Everything runs as your user, with no elevated privileges.
 
 - `Panel.qml` — bar icon, popup, sections, keyboard and confirmation.
 - `lib/ScanQueue.qml` — one scan at a time, rerunning one asked for mid-scan.
+- `lib/dockerHost.js` — which `DOCKER_HOST` the helper is given: only a local socket.
 - `bin/ports.py` — `scan` prints every listener as JSON; `signal` and `stop`
   act on one. Run it directly to see what the panel sees:
 

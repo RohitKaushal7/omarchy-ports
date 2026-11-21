@@ -484,7 +484,8 @@ class OutputTooLarge(subprocess.SubprocessError):
         self.limit = limit
 
 
-def run_bounded(argv, *, timeout: float, limit: int = MAX_CHILD_OUTPUT, **_ignored) -> subprocess.CompletedProcess:
+def run_bounded(argv, *, timeout: float, limit: int = MAX_CHILD_OUTPUT, env=None,
+                **_ignored) -> subprocess.CompletedProcess:
     """subprocess.run for children whose output size is not ours to trust.
 
     stdout and stderr are read together, up to `limit` bytes and within
@@ -494,7 +495,7 @@ def run_bounded(argv, *, timeout: float, limit: int = MAX_CHILD_OUTPUT, **_ignor
     """
     argv = list(argv)
     deadline = time.monotonic() + timeout
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     received = {process.stdout: bytearray(), process.stderr: bytearray()}
     total = 0
@@ -698,9 +699,37 @@ def signal_process(pid: int, start: int, signal_name: str) -> None:
         os.close(pidfd)
 
 
-def docker(run, args: list[str], timeout: float = 10) -> str:
+# Only the Docker on this machine is ever asked. Its published ports are
+# listed, opened and copied as this machine's, so ports from a daemon
+# somewhere else would show up as local ones, with localhost URLs that reach
+# whatever happens to be listening here instead.
+REMOTE_DOCKER = "Docker skipped: DOCKER_HOST isn't a local socket"
+
+
+def docker_is_local(environ) -> bool:
+    """DOCKER_HOST unset (the system daemon) or a unix socket path (rootless
+    Docker). tcp://, ssh:// and anything else may be another machine."""
+    host = environ.get("DOCKER_HOST", "")
+    return host == "" or (host.startswith("unix://") and len(host) > len("unix://"))
+
+
+def docker_environment(environ) -> dict:
+    """The environment docker runs with: this one, with the default context
+    forced. Without that, a current context set by `docker context use`
+    (read from ~/.docker even when HOME is unset) or by DOCKER_CONTEXT
+    decides where docker connects, and it can name another machine.
+    DOCKER_HOST still takes precedence over DOCKER_CONTEXT, which is why it is
+    checked by docker_is_local first."""
+    return {**environ, "DOCKER_CONTEXT": "default"}
+
+
+def docker(run, args: list[str], timeout: float = 10, environ=None) -> str:
+    environ = os.environ if environ is None else environ
+    if not docker_is_local(environ):
+        raise ActionError(REMOTE_DOCKER)
     try:
-        result = run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+        result = run(["docker", *args], capture_output=True, text=True, timeout=timeout,
+                     env=docker_environment(environ))
     except FileNotFoundError:
         raise ActionError("Docker is not installed") from None
     except OSError as error:
@@ -762,12 +791,16 @@ def scan(include_udp: bool, include_docker: bool, ignored: set[int]) -> dict:
     sockets = listening_sockets(include_udp, warnings)
     containers: list[dict] = []
     # No docker binary means a machine without docker, which says nothing. A
-    # docker that is installed but unreachable is worth a line in the panel.
+    # docker that is installed but unreachable is worth a line in the panel,
+    # and so is one pointed at somewhere other than this machine.
     if include_docker and shutil.which("docker"):
-        try:
-            containers = container_ports(running_containers())
-        except ActionError as error:
-            warnings.append(f"Docker: {error}")
+        if not docker_is_local(os.environ):
+            warnings.append(REMOTE_DOCKER)
+        else:
+            try:
+                containers = container_ports(running_containers())
+            except ActionError as error:
+                warnings.append(f"Docker: {error}")
     return {
         "scannedAt": int(time.time()),
         "listeners": limit_listeners(build_listeners(sockets, containers, describe_holder, ignored), warnings),
