@@ -147,20 +147,27 @@ Everything runs as your user, with no elevated privileges.
 
 - The panel starts one helper, `bin/ports.py`, as `/usr/bin/python3 -I` with
   an emptied environment: `PATH=/usr/bin:/bin` and `LC_ALL=C`, plus
-  `DOCKER_HOST` when it is a `unix://` socket (rootless Docker). No shell is
+  `DOCKER_HOST` when it is a `unix://` socket, or, when `DOCKER_HOST` is
+  unset, `DOCKER_CONTEXT` and `DOCKER_CONFIG` if they are set. No shell is
   involved at any step.
-- Only Docker on this machine is scanned. With `DOCKER_HOST` set to anything
-  but a `unix://` socket — `tcp://`, `ssh://` — Docker is skipped and the
-  panel says so, and `docker` always runs with `DOCKER_CONTEXT=default`, so a
-  context chosen with `docker context use` cannot point it elsewhere.
-- The helper reads `ss` and `/proc`, and runs `docker ps` and `docker inspect`
-  when Docker support is on. It makes no network requests.
+- Only Docker on this machine is scanned: the daemon must be a `unix://`
+  socket. That socket comes from `DOCKER_HOST` when it is set, and otherwise
+  from the current Docker context (`docker context use`, or
+  `DOCKER_CONTEXT`), so rootless Docker works whether it is set up through
+  `DOCKER_HOST` or through its `rootless` context, and so does Docker
+  Desktop's `desktop-linux`. A `tcp://` or `ssh://` host or context is
+  skipped, and the panel says so. The socket is looked up once per scan or
+  stop and passed to every `docker` call that follows as `DOCKER_HOST`.
+- The helper reads `ss` and `/proc`, and runs `docker context inspect`,
+  `docker ps` and `docker inspect` when Docker support is on. It makes no
+  network requests.
 - Output from `ss` and `docker` is read up to 4 MiB and within a deadline —
-  5 s for `ss`, 10 s for Docker queries, 30 s for `docker stop` — and the
-  child is killed when it passes either.
+  5 s for `ss` and for finding Docker's socket, 10 s for other Docker
+  queries, 30 s for `docker stop` — and the child is killed when it passes
+  either.
 - The helper prints at most 512 listeners, with every command line, path and
   image name cut at 512 characters. The panel stops a helper that prints more
-  than 2 MiB, or that runs past 35 s for a scan or 45 s for an action.
+  than 2 MiB, or that runs past 40 s for a scan or 50 s for an action.
 - A process row records the start time of the process `ss` saw holding the
   socket: while the scan reads `/proc`, the PID must still hold that socket
   (its fd links to the inode `ss` reported) under the same name, and its start
@@ -182,7 +189,8 @@ Everything runs as your user, with no elevated privileges.
 
 - `Panel.qml` — bar icon, popup, sections, keyboard and confirmation.
 - `lib/ScanQueue.qml` — one scan at a time, rerunning one asked for mid-scan.
-- `lib/dockerHost.js` — which `DOCKER_HOST` the helper is given: only a local socket.
+- `lib/dockerHost.js` — which Docker variables the helper is given: `DOCKER_HOST`
+  only as a local socket.
 - `bin/ports.py` — `scan` prints every listener as JSON; `signal` and `stop`
   act on one. Run it directly to see what the panel sees:
 

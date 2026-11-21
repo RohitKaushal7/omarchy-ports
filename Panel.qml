@@ -72,20 +72,22 @@ Panel {
   // environment. The interpreter is never looked up on PATH (a version
   // manager's shim would otherwise decide what runs), no PYTHON* variables or
   // user site directory apply, and ss and docker resolve from /usr/bin and
-  // /bin only. DOCKER_HOST is the one variable passed through, for rootless
-  // Docker, and only while it is a local socket: Docker on another machine is
-  // not scanned at all, and the panel says so.
+  // /bin only. Docker's own variables are the exception (lib/dockerHost.js
+  // says which), and DOCKER_HOST only while it is a local socket: Docker on
+  // another machine is not scanned at all, and the panel says so.
   readonly property string dockerHost: String(Quickshell.env("DOCKER_HOST") || "")
   readonly property bool dockerIsLocal: DockerHost.isLocal(root.dockerHost)
   readonly property string dockerNote: root.includeDocker && !root.dockerIsLocal ? DockerHost.skippedNote : ""
-  readonly property var helperEnvironment: DockerHost.helperEnvironment(root.dockerHost)
+  readonly property var helperEnvironment: DockerHost.helperEnvironment(
+    root.dockerHost, Quickshell.env("DOCKER_CONTEXT"), Quickshell.env("DOCKER_CONFIG"))
 
   // The helper bounds its own output well below this and times out its own
   // children; these only catch the helper itself misbehaving. The deadlines
-  // sit above its slowest paths: a full scan with Docker, and docker stop.
+  // sit above its slowest paths: a full scan with Docker (35 s, every child
+  // at its own deadline), and docker stop (45 s).
   readonly property int maxHelperChars: 2 * 1024 * 1024
-  readonly property int scanDeadlineMs: 35000
-  readonly property int actionDeadlineMs: 45000
+  readonly property int scanDeadlineMs: 40000
+  readonly property int actionDeadlineMs: 50000
 
   // Codepoints rather than pasted glyphs, so each one can be looked up.
   readonly property var glyphs: ({

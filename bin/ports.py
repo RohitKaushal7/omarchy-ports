@@ -707,33 +707,20 @@ def signal_process(pid: int, start: int, signal_name: str) -> None:
 # listed, opened and copied as this machine's, so ports from a daemon
 # somewhere else would show up as local ones, with localhost URLs that reach
 # whatever happens to be listening here instead.
-REMOTE_DOCKER = "Docker skipped: DOCKER_HOST isn't a local socket"
+class RemoteDocker(ActionError):
+    """Docker is set up to talk to a daemon that may not be on this machine."""
 
 
-def docker_is_local(environ) -> bool:
-    """DOCKER_HOST unset (the system daemon) or a unix socket path (rootless
-    Docker). tcp://, ssh:// and anything else may be another machine."""
-    host = environ.get("DOCKER_HOST", "")
-    return host == "" or (host.startswith("unix://") and len(host) > len("unix://"))
+REMOTE_HOST = "DOCKER_HOST isn't a local socket"
+REMOTE_DOCKER = f"Docker skipped: {REMOTE_HOST}"
+UNIX_SOCKET = re.compile(r"unix://\S+")
+# What docker allows a context to be called.
+CONTEXT_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.+-]*")
 
 
-def docker_environment(environ) -> dict:
-    """The environment docker runs with: this one, with the default context
-    forced. Without that, a current context set by `docker context use`
-    (read from ~/.docker even when HOME is unset) or by DOCKER_CONTEXT
-    decides where docker connects, and it can name another machine.
-    DOCKER_HOST still takes precedence over DOCKER_CONTEXT, which is why it is
-    checked by docker_is_local first."""
-    return {**environ, "DOCKER_CONTEXT": "default"}
-
-
-def docker(run, args: list[str], timeout: float = 10, environ=None) -> str:
-    environ = os.environ if environ is None else environ
-    if not docker_is_local(environ):
-        raise ActionError(REMOTE_DOCKER)
+def run_docker(run, args: list[str], env: dict, timeout: float = 10) -> str:
     try:
-        result = run(["docker", *args], capture_output=True, text=True, timeout=timeout,
-                     env=docker_environment(environ))
+        result = run(["docker", *args], capture_output=True, text=True, timeout=timeout, env=env)
     except FileNotFoundError:
         raise ActionError("Docker is not installed") from None
     except OSError as error:
@@ -747,25 +734,61 @@ def docker(run, args: list[str], timeout: float = 10, environ=None) -> str:
     return result.stdout
 
 
-def stop_container(container_id: str, run=run_bounded) -> None:
+def docker_endpoint(run, environ) -> str:
+    """The unix socket of the daemon docker would use for this user, or
+    RemoteDocker when that is anything else (tcp://, ssh://, ...).
+
+    DOCKER_HOST decides when it is set. Otherwise the current context does,
+    the one `docker context use` chose or DOCKER_CONTEXT names, found the way
+    docker finds it in a terminal (~/.docker comes from the passwd entry when
+    HOME is unset). Rootless Docker's `rootless` context and Docker Desktop's
+    `desktop-linux` are both sockets on this machine."""
+    host = environ.get("DOCKER_HOST", "")
+    if host:
+        if UNIX_SOCKET.fullmatch(host):
+            return host
+        raise RemoteDocker(REMOTE_HOST)
+    answer = run_docker(run, ["context", "inspect", "--format", "{{.Name}} {{.Endpoints.docker.Host}}"],
+                        environ, timeout=5)
+    name, _, host = answer.strip().partition(" ")
+    if UNIX_SOCKET.fullmatch(host):
+        return host
+    context = f'context "{name}"' if CONTEXT_NAME.fullmatch(name) else "the current Docker context"
+    raise RemoteDocker(f"{context} isn't a local socket")
+
+
+def local_docker(run, environ=None):
+    """docker(args, timeout=10) for this machine's daemon. Its socket is
+    looked up once, then handed to every call as DOCKER_HOST, which outranks
+    any context; DOCKER_CONTEXT=default is set as well, so nothing else in
+    the environment or ~/.docker can send a call anywhere else."""
+    environ = os.environ if environ is None else environ
+    host = docker_endpoint(run, environ)
+    env = {**environ, "DOCKER_HOST": host, "DOCKER_CONTEXT": "default"}
+    return functools.partial(run_docker, run, env=env)
+
+
+def stop_container(container_id: str, run=run_bounded, environ=None) -> None:
     # The id reaches docker as one argv entry, never through a shell, but it
     # is still checked: the panel should only ever pass back what inspect gave.
     if not CONTAINER_ID.fullmatch(str(container_id or "")):
         raise ActionError("Not a Docker container id")
-    if docker(run, ["inspect", "--format", "{{.State.Running}}", container_id]).strip() != "true":
+    docker = local_docker(run, environ)
+    if docker(["inspect", "--format", "{{.State.Running}}", container_id]).strip() != "true":
         raise ActionError("That container is no longer running")
-    docker(run, ["stop", container_id], timeout=30)
+    docker(["stop", container_id], timeout=30)
 
 
-def running_containers(run=run_bounded) -> list[dict]:
+def running_containers(run=run_bounded, environ=None) -> list[dict]:
+    docker = local_docker(run, environ)
     # Only tokens shaped like container ids go back to docker: anything else
     # on stdout (a warning, a misbehaving plugin) must not become arguments.
-    ids = [token for token in docker(run, ["ps", "--quiet", "--no-trunc"]).split()
+    ids = [token for token in docker(["ps", "--quiet", "--no-trunc"]).split()
            if CONTAINER_ID.fullmatch(token)]
     if not ids:
         return []
     try:
-        return json.loads(docker(run, ["inspect", *ids]))
+        return json.loads(docker(["inspect", *ids]))
     except json.JSONDecodeError:
         raise ActionError("docker inspect printed something unreadable") from None
 
@@ -798,13 +821,12 @@ def scan(include_udp: bool, include_docker: bool, ignored: set[int]) -> dict:
     # docker that is installed but unreachable is worth a line in the panel,
     # and so is one pointed at somewhere other than this machine.
     if include_docker and shutil.which("docker"):
-        if not docker_is_local(os.environ):
-            warnings.append(REMOTE_DOCKER)
-        else:
-            try:
-                containers = container_ports(running_containers())
-            except ActionError as error:
-                warnings.append(f"Docker: {error}")
+        try:
+            containers = container_ports(running_containers())
+        except RemoteDocker as error:
+            warnings.append(f"Docker skipped: {error}")
+        except ActionError as error:
+            warnings.append(f"Docker: {error}")
     return {
         "scannedAt": int(time.time()),
         "listeners": limit_listeners(build_listeners(sockets, containers, describe_holder, ignored), warnings),

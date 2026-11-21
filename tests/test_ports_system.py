@@ -162,46 +162,68 @@ class FakeDocker:
 
 
 INSPECT_RUNNING = ["docker", "inspect", "--format", "{{.State.Running}}", REDIS_ID]
+INSPECT_CONTEXT = ["docker", "context", "inspect", "--format", "{{.Name}} {{.Endpoints.docker.Host}}"]
+LOCAL_CONTEXT = (0, "default unix:///var/run/docker.sock\n", "")
+
+
+def stand_in(**replies):
+    return FakeDocker({"context": LOCAL_CONTEXT, **replies})
 
 
 class StopContainerTests(unittest.TestCase):
     def test_malformed_ids_never_reach_docker(self):
         for bad in ("", "abc", "postgres; rm -rf /", "g" * 64, REDIS_ID[:11]):
-            docker = FakeDocker({"inspect": (0, "true\n", ""), "stop": (0, "", "")})
+            docker = stand_in(inspect=(0, "true\n", ""), stop=(0, "", ""))
             with self.assertRaises(ports.ActionError, msg=bad):
-                ports.stop_container(bad, run=docker)
+                ports.stop_container(bad, run=docker, environ={})
             self.assertEqual(docker.calls, [], bad)
 
     def test_container_that_is_not_running_is_not_stopped(self):
-        docker = FakeDocker({"inspect": (0, "false\n", "")})
+        docker = stand_in(inspect=(0, "false\n", ""))
         with self.assertRaises(ports.ActionError):
-            ports.stop_container(REDIS_ID, run=docker)
-        self.assertEqual(docker.calls, [INSPECT_RUNNING])
+            ports.stop_container(REDIS_ID, run=docker, environ={})
+        self.assertEqual(docker.calls, [INSPECT_CONTEXT, INSPECT_RUNNING])
 
     def test_running_container_is_stopped(self):
-        docker = FakeDocker({"inspect": (0, "true\n", ""), "stop": (0, REDIS_ID + "\n", "")})
-        ports.stop_container(REDIS_ID, run=docker)
-        self.assertEqual(docker.calls, [INSPECT_RUNNING, ["docker", "stop", REDIS_ID]])
+        docker = stand_in(inspect=(0, "true\n", ""), stop=(0, REDIS_ID + "\n", ""))
+        ports.stop_container(REDIS_ID, run=docker, environ={})
+        self.assertEqual(docker.calls, [INSPECT_CONTEXT, INSPECT_RUNNING, ["docker", "stop", REDIS_ID]])
 
-    def test_every_docker_call_forces_the_default_context(self):
-        docker = FakeDocker({"inspect": (0, "true\n", ""), "stop": (0, "", "")})
-        with mock.patch.dict(os.environ, {"DOCKER_CONTEXT": "elsewhere"}):
-            ports.stop_container(REDIS_ID, run=docker)
-        self.assertEqual([env["DOCKER_CONTEXT"] for env in docker.environments], ["default", "default"])
+    def test_stop_goes_to_the_socket_the_current_context_names(self):
+        # dockerd-rootless-setuptool.sh's context, chosen with `docker context use`.
+        docker = stand_in(context=(0, "rootless unix:///run/user/1000/docker.sock\n", ""),
+                          inspect=(0, "true\n", ""), stop=(0, "", ""))
+        ports.stop_container(REDIS_ID, run=docker, environ={"DOCKER_CONTEXT": "rootless"})
+        resolve, *calls = docker.environments
+        self.assertEqual(resolve, {"DOCKER_CONTEXT": "rootless"})
+        self.assertEqual(calls, [{"DOCKER_HOST": "unix:///run/user/1000/docker.sock",
+                                  "DOCKER_CONTEXT": "default"}] * 2)
+
+    def test_a_context_elsewhere_is_never_asked_to_stop(self):
+        for answer in ("elsewhere tcp://10.0.0.5:2376\n", "box ssh://me@build-box\n", "default \n", ""):
+            docker = stand_in(context=(0, answer, ""), inspect=(0, "true\n", ""), stop=(0, "", ""))
+            with self.assertRaises(ports.RemoteDocker, msg=answer):
+                ports.stop_container(REDIS_ID, run=docker, environ={})
+            self.assertEqual(docker.calls, [INSPECT_CONTEXT], answer)
 
     def test_a_docker_host_elsewhere_is_never_asked_to_stop(self):
         for host in ("tcp://10.0.0.5:2376", "ssh://me@build-box", "tcp://127.0.0.1:2375", "unix://"):
-            docker = FakeDocker({"inspect": (0, "true\n", ""), "stop": (0, "", "")})
-            with mock.patch.dict(os.environ, {"DOCKER_HOST": host}), \
-                    self.assertRaises(ports.ActionError, msg=host):
-                ports.stop_container(REDIS_ID, run=docker)
+            docker = stand_in(inspect=(0, "true\n", ""), stop=(0, "", ""))
+            with self.assertRaises(ports.RemoteDocker, msg=host):
+                ports.stop_container(REDIS_ID, run=docker, environ={"DOCKER_HOST": host})
             self.assertEqual(docker.calls, [], host)
+
+    def test_a_local_docker_host_is_used_without_asking_the_context(self):
+        docker = stand_in(inspect=(0, "true\n", ""), stop=(0, "", ""))
+        ports.stop_container(REDIS_ID, run=docker, environ={"DOCKER_HOST": "unix:///run/user/1000/docker.sock"})
+        self.assertEqual(docker.calls, [INSPECT_RUNNING, ["docker", "stop", REDIS_ID]])
+        self.assertEqual({env["DOCKER_HOST"] for env in docker.environments}, {"unix:///run/user/1000/docker.sock"})
 
     def test_docker_refusing_to_stop_is_an_action_error(self):
         docker = FakeDocker({"inspect": (0, "true\n", ""),
                              "stop": (1, "", "Error response from daemon: permission denied")})
         with self.assertRaises(ports.ActionError):
-            ports.stop_container(REDIS_ID, run=docker)
+            ports.stop_container(REDIS_ID, run=docker, environ={})
 
 
 class CliTests(ChildProcessCase):
@@ -283,15 +305,19 @@ class CliTests(ChildProcessCase):
         return dict(environment, PATH=directory)
 
     # A stand-in docker that notes how it was run, one JSON line per call,
-    # and reports no containers.
+    # answers `context inspect` with FAKE_CONTEXT (the default context's
+    # local socket unless set), and reports no containers.
     RECORDING_DOCKER = (
         "#!/usr/bin/python3\n"
         "import json, os, sys\n"
         "with open(os.path.join(os.path.dirname(sys.argv[0]), 'calls'), 'a') as log:\n"
         "    log.write(json.dumps({'argv': sys.argv[1:], 'context': os.environ.get('DOCKER_CONTEXT'),\n"
         "                          'host': os.environ.get('DOCKER_HOST')}) + '\\n')\n"
+        "if sys.argv[1] == 'context':\n"
+        "    print(os.environ.get('FAKE_CONTEXT', 'default unix:///var/run/docker.sock'))\n"
         "sys.exit(0)\n"
     )
+    CONTEXT_ARGV = ["context", "inspect", "--format", "{{.Name}} {{.Endpoints.docker.Host}}"]
 
     def docker_calls(self, env):
         log = Path(env["PATH"], "calls")
@@ -316,15 +342,39 @@ class CliTests(ChildProcessCase):
              "host": "unix:///run/user/1000/docker.sock"},
         ])
 
-    def test_without_docker_host_the_default_context_is_forced(self):
-        # A context chosen with `docker context use` or DOCKER_CONTEXT could
-        # point anywhere; DOCKER_CONTEXT=default overrides both.
-        env = dict(self.fake_path(self.RECORDING_DOCKER), DOCKER_CONTEXT="elsewhere")
+    def test_the_default_context_is_scanned_through_its_socket(self):
+        env = self.fake_path(self.RECORDING_DOCKER)
         code, payload = self.run_cli("scan", env=env)
         self.assertEqual((code, payload["warnings"]), (0, []))
         self.assertEqual(self.docker_calls(env), [
-            {"argv": ["ps", "--quiet", "--no-trunc"], "context": "default", "host": None},
+            {"argv": self.CONTEXT_ARGV, "context": None, "host": None},
+            {"argv": ["ps", "--quiet", "--no-trunc"], "context": "default", "host": "unix:///var/run/docker.sock"},
         ])
+
+    def test_a_context_naming_a_local_socket_is_scanned(self):
+        # Rootless Docker's `rootless` context, or Docker Desktop's
+        # `desktop-linux`, picked by DOCKER_CONTEXT or `docker context use`.
+        env = dict(self.fake_path(self.RECORDING_DOCKER), DOCKER_CONTEXT="rootless",
+                   FAKE_CONTEXT="rootless unix:///run/user/1000/docker.sock")
+        code, payload = self.run_cli("scan", env=env)
+        self.assertEqual((code, payload["warnings"]), (0, []))
+        self.assertEqual(self.docker_calls(env), [
+            {"argv": self.CONTEXT_ARGV, "context": "rootless", "host": None},
+            {"argv": ["ps", "--quiet", "--no-trunc"], "context": "default",
+             "host": "unix:///run/user/1000/docker.sock"},
+        ])
+
+    def test_a_context_elsewhere_is_not_scanned_and_says_so(self):
+        cases = {
+            "elsewhere tcp://10.0.0.5:2376": 'Docker skipped: context "elsewhere" isn\'t a local socket',
+            "box ssh://me@build-box": 'Docker skipped: context "box" isn\'t a local socket',
+            "": "Docker skipped: the current Docker context isn't a local socket",
+        }
+        for answer, warning in cases.items():
+            env = dict(self.fake_path(self.RECORDING_DOCKER), FAKE_CONTEXT=answer)
+            code, payload = self.run_cli("scan", env=env)
+            self.assertEqual((code, payload["warnings"]), (0, [warning]), answer)
+            self.assertEqual([call["argv"] for call in self.docker_calls(env)], [self.CONTEXT_ARGV], answer)
 
     def test_unreachable_docker_is_a_warning_and_sockets_still_list(self):
         _, port = self.listening()
@@ -357,6 +407,9 @@ class CliTests(ChildProcessCase):
         script = (
             "#!/usr/bin/python3\n"
             "import sys\n"
+            "if sys.argv[1] == 'context':\n"
+            "    print('default unix:///var/run/docker.sock')\n"
+            "    sys.exit(0)\n"
             "if sys.argv[1] == 'ps':\n"
             "    print('WARNING: not a container id')\n"
             f"    print('{real_id}')\n"
