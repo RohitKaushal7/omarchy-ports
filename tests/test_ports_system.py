@@ -70,7 +70,10 @@ class ChildProcessCase(unittest.TestCase):
 class DescribeProcessTests(ChildProcessCase):
     def test_own_child_is_described(self):
         with tempfile.TemporaryDirectory() as workdir:
-            child = self.spawn(cwd=workdir)
+            # Popen returns while the kernel is still setting up the child's
+            # new image, when its cmdline can read empty; wait until it runs.
+            child = self.spawn("print('up', flush=True); import time; time.sleep(60)", cwd=workdir)
+            child.stdout.readline()
             details = ports.describe_process(child.pid)
             self.assertIsNotNone(details)
             self.assertTrue(details["owned"])
