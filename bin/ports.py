@@ -176,7 +176,10 @@ MAX_CHILD_OUTPUT = 4 * 1024 * 1024
 # One `("name",pid=N,fd=N)` entry from ss's users:(...) column. Names can hold
 # spaces and escaped quotes, so this is matched against the whole line rather
 # than a whitespace-split field.
-USERS_ENTRY = re.compile(r'\("((?:[^"\\]|\\.)*)",pid=(\d+),fd=\d+\)')
+USERS_ENTRY = re.compile(r'\("((?:[^"\\]|\\.)*)",pid=(\d+),fd=(\d+)\)')
+# The socket's inode, from `ss -e`. Looked for only once the users:(...)
+# entries are gone, since a process name could itself read "ino:1".
+SOCKET_INODE = re.compile(r"(?<!\S)ino:(\d+)(?!\S)")
 
 
 class ActionError(Exception):
@@ -250,8 +253,11 @@ def interface_owner(interfaces: list[str]) -> str | None:
 
 
 def parse_sockets(text: str, proto: str) -> list[dict]:
-    """Rows of `ss -H -l -n -p` for one protocol. The local endpoint is always
-    the fourth column; everything after the peer column is process info."""
+    """Rows of `ss -H -l -n -p -e` for one protocol. The local endpoint is
+    always the fourth column; everything after the peer column is process and
+    socket info. Each holder keeps the fd it holds the socket on, and the
+    socket its inode (0 if ss gave none), so a pid can later be checked
+    against the socket it was named for."""
     sockets = []
     for line in text.splitlines():
         fields = line.split()
@@ -261,9 +267,11 @@ def parse_sockets(text: str, proto: str) -> list[dict]:
         if endpoint is None:
             continue
         address, port, interface = endpoint
-        processes = [{"name": name, "pid": int(pid)} for name, pid in USERS_ENTRY.findall(line)]
+        processes = [{"name": name, "pid": int(pid), "fd": int(fd)}
+                     for name, pid, fd in USERS_ENTRY.findall(line)]
+        inode = SOCKET_INODE.search(USERS_ENTRY.sub("", line))
         sockets.append({"proto": proto, "address": address, "port": port, "interface": interface,
-                        "processes": processes})
+                        "inode": int(inode[1]) if inode else 0, "processes": processes})
     return sockets
 
 
@@ -327,13 +335,16 @@ def container_ports(inspected: list[dict]) -> list[dict]:
 # ----------------------------------------------------------------- grouping
 
 def process_owner(name: str, pid: int, details: dict | None) -> dict:
-    # A process that exits between ss and /proc has no details; it is shown,
+    # A process that exits between ss and /proc, or whose pid no longer holds
+    # the socket by the time it is looked at, has no details; it is shown,
     # but as read-only, since there is nothing left to verify a signal against.
+    verified = details is not None
     details = details or {}
     return {
         "kind": "process",
         "name": truncate(name),
         "pid": pid,
+        "verified": verified,
         "owned": bool(details.get("owned")),
         "start": int(details.get("start") or 0),
         "startedAt": int(details.get("startedAt") or 0),
@@ -399,14 +410,18 @@ def build_listeners(sockets: list[dict], containers: list[dict], describe, ignor
         # is the one that opened it, and the one worth signalling. A service
         # manager that keeps an activated socket open is passed over for the
         # service it started.
-        holders = sorted((process["pid"], process["name"]) for process in sock["processes"])
-        servers = [h for h in holders if h[1] not in SERVICE_MANAGERS] or holders
-        owner_pid, owner_name = servers[0] if servers else (None, "")
+        holders = sorted(sock["processes"], key=lambda process: process["pid"])
+        servers = [h for h in holders if h["name"] not in SERVICE_MANAGERS] or holders
+        holder = servers[0] if servers else None
+        owner_pid = holder["pid"] if holder else None
         entry = group((sock["proto"], sock["port"], "pid", owner_pid), sock["proto"], sock["port"])
         add_address(entry, sock["address"], sock.get("interface", ""))
-        if owner_pid is not None and entry["owner"] is None:
-            entry["owner"] = process_owner(owner_name, owner_pid, describe(owner_pid))
-            if owner_name in SERVICE_MANAGERS:
+        if holder and entry["owner"] is None:
+            # Described against this socket, so the start time a signal is
+            # later checked against belongs to the process that held it.
+            details = describe(owner_pid, holder["name"], holder.get("fd"), sock.get("inode", 0))
+            entry["owner"] = process_owner(holder["name"], owner_pid, details)
+            if holder["name"] in SERVICE_MANAGERS:
                 entry["owner"]["owned"] = False  # shown, never signalled
 
     for binding in containers:
@@ -596,6 +611,48 @@ def describe_process(pid: int, proc_root: str = "/proc") -> dict | None:
     }
 
 
+def shown_by_ss(comm: bytes, name: str) -> bool:
+    """Whether ss would print a process whose comm is `comm` as `name`.
+
+    ss cuts the name at its first ')' (it reads it out of /proc/<pid>/stat)
+    and prints a placeholder, '.' or '?', for every byte outside printable
+    ASCII, so those bytes match either placeholder and nothing else."""
+    comm = comm.rstrip(b"\n").split(b")", 1)[0]
+    if len(comm) != len(name):
+        return False
+    return all(char == chr(byte) if 0x20 <= byte < 0x7F else char in ".?"
+               for byte, char in zip(comm, name))
+
+
+def describe_holder(pid: int, name: str, fd: int | None, inode: int, proc_root: str = "/proc") -> dict | None:
+    """describe_process for the pid ss named as holding a socket, or None
+    unless that pid still holds it.
+
+    ss and /proc are read at different moments, and a pid freed in between
+    can be handed to an unrelated process; describing that one would put its
+    start time on this row, and a signal checked against that start time would
+    reach it. So the start time is read first, the pid must still hold the
+    socket (its fd links to the inode ss reported) under the name ss gave,
+    and the start time must read the same after everything else is read: one
+    process throughout, and the one holding the socket."""
+    if fd is None or fd < 0 or inode <= 0:
+        return None
+    proc_dir = Path(proc_root) / str(pid)
+    try:
+        before = read_start_time(proc_dir)
+        held = os.readlink(proc_dir / "fd" / str(fd)) == f"socket:[{inode}]"
+        comm = (proc_dir / "comm").read_bytes()
+        details = describe_process(pid, proc_root)
+        after = read_start_time(proc_dir)
+    except (OSError, ValueError, IndexError):
+        return None
+    if not held or not shown_by_ss(comm, name) or details is None:
+        return None
+    if not before == details["start"] == after:
+        return None
+    return details
+
+
 def read_comm(pid: int) -> str:
     try:
         return Path(f"/proc/{pid}/comm").read_text().strip()
@@ -686,7 +743,7 @@ def listening_sockets(include_udp: bool, warnings: list[str]) -> list[dict]:
     sockets: list[dict] = []
     for proto in ("tcp", "udp") if include_udp else ("tcp",):
         try:
-            result = run_bounded(["ss", "-H", "-l", "-n", "-p", f"--{proto}"], timeout=5)
+            result = run_bounded(["ss", "-H", "-l", "-n", "-p", "-e", f"--{proto}"], timeout=5)
         except OutputTooLarge:
             warnings.append(f"ss printed too much output for {proto.upper()}")
             continue
@@ -713,7 +770,7 @@ def scan(include_udp: bool, include_docker: bool, ignored: set[int]) -> dict:
             warnings.append(f"Docker: {error}")
     return {
         "scannedAt": int(time.time()),
-        "listeners": limit_listeners(build_listeners(sockets, containers, describe_process, ignored), warnings),
+        "listeners": limit_listeners(build_listeners(sockets, containers, describe_holder, ignored), warnings),
         "warnings": warnings,
     }
 

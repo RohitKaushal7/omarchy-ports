@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,18 @@ class DescribeProcessTests(ChildProcessCase):
 
     def test_exited_process_is_not_described(self):
         self.assertIsNone(ports.describe_process(exited_pid()))
+
+    def test_holder_of_a_real_socket_is_described_against_it(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            inode = os.fstat(listener.fileno()).st_ino
+            comm = Path("/proc/self/comm").read_text().strip()
+            details = ports.describe_holder(os.getpid(), comm, listener.fileno(), inode)
+            self.assertIsNotNone(details)
+            self.assertEqual(details["start"], ports.describe_process(os.getpid())["start"])
+            self.assertIsNone(ports.describe_holder(os.getpid(), comm, listener.fileno(), inode + 1))
+            self.assertIsNone(ports.describe_holder(os.getpid(), comm + "x", listener.fileno(), inode))
 
 
 class SignalProcessTests(ChildProcessCase):
@@ -192,6 +205,7 @@ class CliTests(ChildProcessCase):
         self.assertEqual(listener["owner"]["kind"], "process")
         self.assertEqual(listener["owner"]["pid"], child.pid)
         self.assertTrue(listener["owner"]["owned"])
+        self.assertTrue(listener["owner"]["verified"], "the scan should bind the pid to its socket")
         self.assertEqual(listener["scope"], "local")
         self.assertEqual(listener["url"], f"http://localhost:{port}")
         self.assertIn("terminate", listener["actions"])

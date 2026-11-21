@@ -289,7 +289,8 @@ Panel {
     if (o.kind === "process") {
       if (o.command) lines.push(o.command)
       lines.push(root.startedAgo(o.startedAt, root.scannedAt))
-      if (!o.owned) lines.push("Owned by another user, so it is read-only.")
+      if (o.verified === false) lines.push("It changed or exited during the scan, so it is read-only until the next one.")
+      else if (!o.owned) lines.push("Owned by another user, so it is read-only.")
     } else if (o.kind === "container") {
       lines.push(String(o.image || ""))
       lines.push(root.startedAgo(o.startedAt, root.scannedAt))

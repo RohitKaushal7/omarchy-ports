@@ -1,37 +1,42 @@
 """Behaviour of the Ports collector: turning ss and docker output into listeners."""
 
+import functools
+import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
 import ports  # noqa: E402
 
 
-# Captured from `ss -H -ltnp` as a normal user. Sockets owned by root or by
+# Captured from `ss -H -ltnpe` as a normal user. Sockets owned by root or by
 # another user carry no users:() field; the user's own sockets do. Process
 # names can contain spaces, and a socket inherited by forked workers lists
-# every process holding it. A socket bound to one interface (tailscaled's,
-# the DHCPv6 client's) carries a %iface after the address, outside the
-# brackets of an IPv6 one.
+# every process holding it, each on its own fd. A socket bound to one
+# interface (tailscaled's, the DHCPv6 client's) carries a %iface after the
+# address, outside the brackets of an IPv6 one. -e adds the owning uid (when
+# it is not root), the socket's inode, and v6only on an IPv6 socket.
 SS_TCP = """\
-LISTEN 0      4096                       0.0.0.0:6379  0.0.0.0:*
-LISTEN 0      4096                 127.0.0.53%lo:53    0.0.0.0:*
-LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]:65009    [::]:*
-LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]%tailscale0:65010    [::]:*
-LISTEN 0      4096                   100.90.0.14%tailscale0:57203 0.0.0.0:*
-LISTEN 0      128                          [::1]:51725    [::]:* users:(("python3",pid=112443,fd=6))
-LISTEN 0      511                        0.0.0.0:8080  0.0.0.0:* users:(("nginx",pid=911,fd=6),("nginx",pid=907,fd=6))
-LISTEN 0      128                      127.0.0.1:3000  0.0.0.0:* users:(("Web Content",pid=5150,fd=41))
+LISTEN 0      4096                       0.0.0.0:6379  0.0.0.0:* ino:25465 sk:1003 cgroup:/system.slice/docker.service <->
+LISTEN 0      4096                 127.0.0.53%lo:53    0.0.0.0:* uid:974 ino:5520 sk:3 cgroup:/system.slice/systemd-resolved.service <->
+LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]:65009    [::]:* ino:18034 sk:1005 cgroup:/system.slice/tailscaled.service v6only:1 <->
+LISTEN 0      4096   [fd7a:115c:a1e0::6c01:74c1]%tailscale0:65010    [::]:* ino:18035 sk:1006 cgroup:/system.slice/tailscaled.service v6only:1 <->
+LISTEN 0      4096                   100.90.0.14%tailscale0:57203 0.0.0.0:* ino:18031 sk:1002 cgroup:/system.slice/tailscaled.service <->
+LISTEN 0      128                          [::1]:51725    [::]:* users:(("python3",pid=112443,fd=6)) uid:1000 ino:15437892 sk:40b9 cgroup:/user.slice/user-1000.slice v6only:1 <->
+LISTEN 0      511                        0.0.0.0:8080  0.0.0.0:* users:(("nginx",pid=911,fd=6),("nginx",pid=907,fd=6)) uid:1000 ino:9709935 sk:50dc cgroup:/user.slice <->
+LISTEN 0      128                      127.0.0.1:3000  0.0.0.0:* users:(("Web Content",pid=5150,fd=41)) uid:1000 ino:9714789 sk:612b cgroup:/user.slice <->
 
 not a socket line
 """
 
 SS_UDP = """\
-UNCONN 0      0                             127.0.0.1:57983 0.0.0.0:* users:(("python3",pid=112443,fd=7))
-UNCONN 0      0                                     *:5353        *:*
+UNCONN 0      0                             127.0.0.1:57983 0.0.0.0:* users:(("python3",pid=112443,fd=7)) uid:1000 ino:15392429 sk:20ed cgroup:/user.slice <->
+UNCONN 0      0                                     *:5353        *:* uid:974 ino:5519 sk:12 cgroup:/system.slice/systemd-resolved.service v6only:0 <->
 UNCONN 0      0      [fe80::57c3:2a98:8b6a:e7ed]%wlo1:546      [::]:*
 """
 
@@ -126,26 +131,38 @@ class ClassifyTests(unittest.TestCase):
 class ParseSocketsTests(unittest.TestCase):
     def test_tcp_rows(self):
         self.assertEqual(ports.parse_sockets(SS_TCP, "tcp"), [
-            {"proto": "tcp", "address": "0.0.0.0", "port": 6379, "interface": "", "processes": []},
-            {"proto": "tcp", "address": "127.0.0.53", "port": 53, "interface": "lo", "processes": []},
-            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65009, "interface": "", "processes": []},
-            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65010, "interface": "tailscale0", "processes": []},
-            {"proto": "tcp", "address": "100.90.0.14", "port": 57203, "interface": "tailscale0", "processes": []},
-            {"proto": "tcp", "address": "::1", "port": 51725, "interface": "",
-             "processes": [{"name": "python3", "pid": 112443}]},
-            {"proto": "tcp", "address": "0.0.0.0", "port": 8080, "interface": "",
-             "processes": [{"name": "nginx", "pid": 911}, {"name": "nginx", "pid": 907}]},
-            {"proto": "tcp", "address": "127.0.0.1", "port": 3000, "interface": "",
-             "processes": [{"name": "Web Content", "pid": 5150}]},
+            {"proto": "tcp", "address": "0.0.0.0", "port": 6379, "interface": "", "inode": 25465, "processes": []},
+            {"proto": "tcp", "address": "127.0.0.53", "port": 53, "interface": "lo", "inode": 5520, "processes": []},
+            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65009, "interface": "", "inode": 18034,
+             "processes": []},
+            {"proto": "tcp", "address": "fd7a:115c:a1e0::6c01:74c1", "port": 65010, "interface": "tailscale0",
+             "inode": 18035, "processes": []},
+            {"proto": "tcp", "address": "100.90.0.14", "port": 57203, "interface": "tailscale0", "inode": 18031,
+             "processes": []},
+            {"proto": "tcp", "address": "::1", "port": 51725, "interface": "", "inode": 15437892,
+             "processes": [{"name": "python3", "pid": 112443, "fd": 6}]},
+            {"proto": "tcp", "address": "0.0.0.0", "port": 8080, "interface": "", "inode": 9709935,
+             "processes": [{"name": "nginx", "pid": 911, "fd": 6}, {"name": "nginx", "pid": 907, "fd": 6}]},
+            {"proto": "tcp", "address": "127.0.0.1", "port": 3000, "interface": "", "inode": 9714789,
+             "processes": [{"name": "Web Content", "pid": 5150, "fd": 41}]},
         ])
 
     def test_udp_rows_including_star_address(self):
         self.assertEqual(ports.parse_sockets(SS_UDP, "udp"), [
-            {"proto": "udp", "address": "127.0.0.1", "port": 57983, "interface": "",
-             "processes": [{"name": "python3", "pid": 112443}]},
-            {"proto": "udp", "address": "*", "port": 5353, "interface": "", "processes": []},
-            {"proto": "udp", "address": "fe80::57c3:2a98:8b6a:e7ed", "port": 546, "interface": "wlo1", "processes": []},
+            {"proto": "udp", "address": "127.0.0.1", "port": 57983, "interface": "", "inode": 15392429,
+             "processes": [{"name": "python3", "pid": 112443, "fd": 7}]},
+            {"proto": "udp", "address": "*", "port": 5353, "interface": "", "inode": 5519, "processes": []},
+            # Without -e's fields the socket has no inode to check a holder against.
+            {"proto": "udp", "address": "fe80::57c3:2a98:8b6a:e7ed", "port": 546, "interface": "wlo1", "inode": 0,
+             "processes": []},
         ])
+
+    def test_inode_is_read_from_outside_the_process_names(self):
+        line = ('LISTEN 0 128 127.0.0.1:4000 0.0.0.0:* users:(("x ino:1 y",pid=42,fd=5)) '
+                'uid:1000 ino:777 sk:9 cgroup:/user.slice <->\n')
+        [sock] = ports.parse_sockets(line, "tcp")
+        self.assertEqual(sock["inode"], 777)
+        self.assertEqual(sock["processes"], [{"name": "x ino:1 y", "pid": 42, "fd": 5}])
 
 
 class SplitEndpointTests(unittest.TestCase):
@@ -233,13 +250,13 @@ PROCESSES = {
 }
 
 
-def describe(pid):
+def describe(pid, name=None, fd=None, inode=0):
     return PROCESSES.get(pid)
 
 
-def sock(address, port, proto="tcp", *procs, interface=""):
-    return {"proto": proto, "address": address, "port": port, "interface": interface,
-            "processes": [{"name": name, "pid": pid} for name, pid in procs]}
+def sock(address, port, proto="tcp", *procs, interface="", inode=4321):
+    return {"proto": proto, "address": address, "port": port, "interface": interface, "inode": inode,
+            "processes": [{"name": name, "pid": pid, "fd": 3} for name, pid in procs]}
 
 
 def published(address, port, *, name="redis", cid=REDIS_ID, image="redis:7", container_port=None,
@@ -264,7 +281,7 @@ class BuildListenersTests(unittest.TestCase):
         self.assertEqual([without_key(l) for l in listeners], [{
             "proto": "tcp", "port": 42635, "addresses": ["0.0.0.0", "::"], "interfaces": [],
             "scope": "network", "url": "http://localhost:42635",
-            "owner": {"kind": "process", "name": "python3", "pid": 112443, "owned": True,
+            "owner": {"kind": "process", "name": "python3", "pid": 112443, "verified": True, "owned": True,
                       "start": 227621, "startedAt": 1794902276, "command": "python3 -m http.server 42635",
                       "cwd": "/home/alice/code/site"},
             "actions": ["open", "copy", "terminate", "kill"],
@@ -427,7 +444,8 @@ class BuildListenersTests(unittest.TestCase):
 
     def test_process_that_exited_before_it_was_described_is_read_only(self):
         [listener] = build([sock("127.0.0.1", 5001, "tcp", ("ghost", 777))])
-        self.assertEqual(listener["owner"], {"kind": "process", "name": "ghost", "pid": 777, "owned": False,
+        self.assertEqual(listener["owner"], {"kind": "process", "name": "ghost", "pid": 777, "verified": False,
+                                             "owned": False,
                                              "start": 0, "startedAt": 0, "command": "", "cwd": ""})
         self.assertEqual(listener["actions"], ["open", "copy"])
 
@@ -441,6 +459,107 @@ class BuildListenersTests(unittest.TestCase):
         self.assertEqual([(l["port"], l["proto"]) for l in listeners], [(22, "tcp"), (5353, "tcp"), (5353, "udp")])
 
 
+
+# ------------------------------------------------------------ socket holders
+
+def fake_process(proc_root, pid, *, comm="devserver", start=4242, fds=None, cmdline=b"devserver\0--port\x004000\0"):
+    """A /proc/<pid> with just what describe_holder reads: stat, comm,
+    cmdline, cwd, and fd links (fd number -> link target)."""
+    directory = Path(proc_root, str(pid))
+    (directory / "fd").mkdir(parents=True)
+    (directory / "stat").write_text(f"{pid} ({comm}) S " + " ".join(["0"] * 18 + [str(start)] + ["0"] * 10) + "\n")
+    (directory / "comm").write_text(comm + "\n")
+    (directory / "cmdline").write_bytes(cmdline)
+    os.symlink(proc_root, directory / "cwd")
+    for fd, target in (fds or {}).items():
+        os.symlink(target, directory / "fd" / str(fd))
+
+
+# What ss printed for a dev server on :4000: pid 4100 holding socket 9001 on fd 3.
+SS_DEVSERVER = ('LISTEN 0 128 127.0.0.1:4000 0.0.0.0:* users:(("devserver",pid=4100,fd=3)) '
+                'uid:1000 ino:9001 sk:1 cgroup:/user.slice <->\n')
+
+
+class SocketHolderTests(unittest.TestCase):
+    """A process row carries the start time a later signal is checked
+    against, so it must be the start time of the process ss saw holding the
+    socket, not of whatever has the pid by the time /proc is read."""
+
+    def setUp(self):
+        self.proc = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.proc)
+
+    def scan(self, text=SS_DEVSERVER):
+        describe = functools.partial(ports.describe_holder, proc_root=self.proc)
+        [listener] = ports.build_listeners(ports.parse_sockets(text, "tcp"), [], describe, set())
+        return listener
+
+    def test_the_process_still_holding_the_socket_can_be_signalled(self):
+        fake_process(self.proc, 4100, fds={3: "socket:[9001]"})
+        listener = self.scan()
+        self.assertEqual(listener["owner"]["start"], 4242)
+        self.assertTrue(listener["owner"]["verified"])
+        self.assertEqual(listener["owner"]["command"], "devserver --port 4000")
+        self.assertEqual(listener["actions"], ["open", "copy", "terminate", "kill"])
+
+    def test_a_reused_pid_is_shown_read_only_with_none_of_its_details(self):
+        # The dev server exited after ss ran and its pid went to an unrelated
+        # shell of the same user, with a socket of its own on the same fd.
+        fake_process(self.proc, 4100, comm="bash", start=9999, fds={3: "socket:[5555]"},
+                     cmdline=b"bash\0")
+        listener = self.scan()
+        owner = listener["owner"]
+        self.assertEqual((owner["name"], owner["pid"]), ("devserver", 4100))
+        self.assertFalse(owner["verified"])
+        self.assertFalse(owner["owned"])
+        self.assertEqual((owner["start"], owner["command"]), (0, ""))
+        self.assertNotIn("terminate", listener["actions"])
+        self.assertNotIn("kill", listener["actions"])
+
+    def test_a_reused_pid_without_the_fd_is_not_described(self):
+        fake_process(self.proc, 4100, comm="devserver", start=9999)
+        self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 9001, self.proc))
+
+    def test_the_socket_on_another_fd_is_not_enough(self):
+        fake_process(self.proc, 4100, fds={3: "socket:[5555]", 4: "socket:[9001]"})
+        self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 9001, self.proc))
+
+    def test_a_different_name_is_not_described(self):
+        fake_process(self.proc, 4100, comm="bash", fds={3: "socket:[9001]"})
+        self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 9001, self.proc))
+
+    def test_a_start_time_that_moves_during_the_check_is_not_described(self):
+        fake_process(self.proc, 4100, fds={3: "socket:[9001]"})
+        for reads in ([4242, 4242, 5000], [4242, 5000, 5000], [5000, 4242, 4242]):
+            with mock.patch.object(ports, "read_start_time", side_effect=reads):
+                self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 9001, self.proc), reads)
+
+    def test_a_socket_without_an_inode_or_fd_is_not_described(self):
+        fake_process(self.proc, 4100, fds={3: "socket:[9001]"})
+        self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 0, self.proc))
+        self.assertIsNone(ports.describe_holder(4100, "devserver", None, 9001, self.proc))
+
+    def test_an_exited_holder_is_not_described(self):
+        self.assertIsNone(ports.describe_holder(4100, "devserver", 3, 9001, self.proc))
+
+    def test_ipv6_half_is_bound_to_its_own_socket(self):
+        fake_process(self.proc, 4100, fds={3: "socket:[9001]", 4: "socket:[9002]"})
+        text = ('LISTEN 0 128 [::1]:4000 [::]:* users:(("devserver",pid=4100,fd=4)) '
+                'uid:1000 ino:9002 sk:2 cgroup:/user.slice v6only:1 <->\n') + SS_DEVSERVER
+        listener = self.scan(text)
+        self.assertEqual(listener["addresses"], ["::1", "127.0.0.1"])
+        self.assertIn("terminate", listener["actions"])
+
+    def test_names_compare_the_way_ss_prints_them(self):
+        # ss stops at the first ')' and prints '.' or '?' for any byte outside
+        # printable ASCII, so those bytes match a placeholder and nothing else.
+        for comm, name in ((b"Web Content\n", "Web Content"), (b'a"b)c d', 'a"b'),
+                           ("café x".encode(), "caf?? x"), (b"tab\tx", "tab.x")):
+            self.assertTrue(ports.shown_by_ss(comm, name), (comm, name))
+        for comm, name in ((b"bash", "devserver"), (b"abc", "ab."), (b"abc", "abcd"), (b"devserver2", "devserver")):
+            self.assertFalse(ports.shown_by_ss(comm, name), (comm, name))
+
+
 class OutputBoundsTests(unittest.TestCase):
     """The panel reads the helper's whole JSON document, so every field that
     comes from outside (command lines, working directories, image names) and
@@ -450,7 +569,7 @@ class OutputBoundsTests(unittest.TestCase):
         details = {4001: {"owned": True, "start": 9,
                           "command": "python3 " + "x" * 5000, "cwd": "/home/alice/" + "d" * 1000}}
         [listener] = ports.build_listeners([sock("127.0.0.1", 7000, "tcp", ("python3", 4001))], [],
-                                           details.get, set())
+                                           lambda pid, *holder: details.get(pid), set())
         owner = listener["owner"]
         for field in ("command", "cwd"):
             self.assertLessEqual(len(owner[field]), 512, field)

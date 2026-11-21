@@ -156,6 +156,10 @@ Everything runs as your user, with no elevated privileges.
 - The helper prints at most 512 listeners, with every command line, path and
   image name cut at 512 characters. The panel stops a helper that prints more
   than 2 MiB, or that runs past 35 s for a scan or 45 s for an action.
+- A process row records the start time of the process `ss` saw holding the
+  socket: while the scan reads `/proc`, the PID must still hold that socket
+  (its fd links to the inode `ss` reported) under the same name, and its start
+  time must not change. A row that fails this is shown read-only.
 - A process is only signalled if it is still the one the panel listed: owned by
   you, with the same start time. The signal goes through a pidfd opened
   *before* that check, so a recycled PID can never receive it.
