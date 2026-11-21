@@ -230,6 +230,18 @@ class CliTests(ChildProcessCase):
         self.assertEqual(listener["url"], f"http://localhost:{port}")
         self.assertIn("terminate", listener["actions"])
 
+    def test_a_process_named_like_ss_syntax_is_still_its_own(self):
+        # ss prints names unescaped; this one ends in a backslash before the
+        # closing quote and carries an inode-shaped word.
+        child, port = self.listening("open('/proc/self/comm', 'w').write(' ino:5 \\\\')\n" + TCP_LISTENER)
+        code, payload = self.run_cli("scan", "--no-docker")
+        self.assertEqual(code, 0)
+        [listener] = [l for l in payload["listeners"] if l["port"] == port]
+        self.assertEqual(listener["owner"]["kind"], "process")
+        self.assertEqual((listener["owner"]["pid"], listener["owner"]["name"]), (child.pid, " ino:5 \\"))
+        self.assertTrue(listener["owner"]["verified"])
+        self.assertIn("terminate", listener["actions"])
+
     def test_ignored_port_is_left_out(self):
         _, port = self.listening()
         _, payload = self.run_cli("scan", "--no-docker", "--ignore", f"1-2,{port}")

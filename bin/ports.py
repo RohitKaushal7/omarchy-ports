@@ -173,12 +173,15 @@ MAX_TEXT = 512
 MAX_LISTENERS = 512
 MAX_CHILD_OUTPUT = 4 * 1024 * 1024
 
-# One `("name",pid=N,fd=N)` entry from ss's users:(...) column. Names can hold
-# spaces and escaped quotes, so this is matched against the whole line rather
-# than a whitespace-split field.
-USERS_ENTRY = re.compile(r'\("((?:[^"\\]|\\.)*)",pid=(\d+),fd=(\d+)\)')
-# The socket's inode, from `ss -e`. Looked for only once the users:(...)
-# entries are gone, since a process name could itself read "ino:1".
+# ss's users:(...) column, and one `("name",pid=N,fd=N)` entry in it. ss
+# prints a process name as-is between the quotes, with no escaping: it can
+# hold spaces, quotes, backslashes and text such as `",pid=1,fd=2` or
+# `ino:5`. What it can never hold is ')', since ss cuts the name at the first
+# one, so each entry runs greedily up to the `",pid=N,fd=N)` that closes it.
+USERS_COLUMN = re.compile(r'users:\(((?:\("[^)]*",pid=\d+,fd=\d+\),?)*)\)')
+USERS_ENTRY = re.compile(r'\("([^)]*)",pid=(\d+),fd=(\d+)\)')
+# The socket's inode, from `ss -e`. Read only after the users:(...) column,
+# where no process name can reach.
 SOCKET_INODE = re.compile(r"(?<!\S)ino:(\d+)(?!\S)")
 
 
@@ -267,9 +270,10 @@ def parse_sockets(text: str, proto: str) -> list[dict]:
         if endpoint is None:
             continue
         address, port, interface = endpoint
+        users = USERS_COLUMN.search(line)
         processes = [{"name": name, "pid": int(pid), "fd": int(fd)}
-                     for name, pid, fd in USERS_ENTRY.findall(line)]
-        inode = SOCKET_INODE.search(USERS_ENTRY.sub("", line))
+                     for name, pid, fd in USERS_ENTRY.findall(users[1] if users else "")]
+        inode = SOCKET_INODE.search(line, users.end() if users else 0)
         sockets.append({"proto": proto, "address": address, "port": port, "interface": interface,
                         "inode": int(inode[1]) if inode else 0, "processes": processes})
     return sockets

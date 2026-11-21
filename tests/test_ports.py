@@ -157,6 +157,40 @@ class ParseSocketsTests(unittest.TestCase):
              "processes": []},
         ])
 
+    def test_names_are_read_raw_up_to_the_entry_that_closes_them(self):
+        # As ss printed them, unescaped. A name can never hold ')', since ss
+        # cuts it at the first one.
+        line = ('LISTEN 0 128 [::1]:32999 [::]:* users:((" ino:5 \\",pid=2763562,fd=3)) '
+                'uid:1000 ino:17164749 sk:6140 cgroup:/user.slice v6only:1 <->\n')
+        [sock] = ports.parse_sockets(line, "tcp")
+        self.assertEqual(sock["inode"], 17164749)
+        self.assertEqual(sock["processes"], [{"name": " ino:5 \\", "pid": 2763562, "fd": 3}])
+
+    def test_a_name_cannot_pose_as_another_entry_or_hide_a_worker(self):
+        line = ('LISTEN 0 511 0.0.0.0:8080 0.0.0.0:* users:(("x",pid=1,fd=2",pid=911,fd=6),'
+                '("a"b",pid=907,fd=6),("we\\ird",pid=905,fd=7)) uid:1000 ino:9709935 sk:50dc <->\n')
+        [sock] = ports.parse_sockets(line, "tcp")
+        self.assertEqual(sock["inode"], 9709935)
+        self.assertEqual(sock["processes"], [
+            {"name": 'x",pid=1,fd=2', "pid": 911, "fd": 6},
+            {"name": 'a"b', "pid": 907, "fd": 6},
+            {"name": "we\\ird", "pid": 905, "fd": 7},
+        ])
+        # So the socket still belongs to the lowest real pid, not to pid 1.
+        [listener] = ports.build_listeners([sock], [], lambda pid, *holder: PROCESSES.get(pid), set())
+        self.assertEqual(listener["owner"]["pid"], 905)
+
+    def test_a_name_cannot_make_its_socket_look_hidden(self):
+        # Parsed as a socket with no holder, this would be listed as owned by
+        # root, and a published container on the port would take it over.
+        line = ('LISTEN 0 128 0.0.0.0:6379 0.0.0.0:* users:(("x\\",pid=4100,fd=3)) '
+                'uid:1000 ino:9001 sk:1 <->\n')
+        [sock] = ports.parse_sockets(line, "tcp")
+        self.assertEqual([p["pid"] for p in sock["processes"]], [4100])
+        listeners = ports.build_listeners([sock], [published("0.0.0.0", 6379)],
+                                          lambda pid, *holder: None, set())
+        self.assertEqual(sorted(l["owner"]["kind"] for l in listeners), ["container", "process"])
+
     def test_inode_is_read_from_outside_the_process_names(self):
         line = ('LISTEN 0 128 127.0.0.1:4000 0.0.0.0:* users:(("x ino:1 y",pid=42,fd=5)) '
                 'uid:1000 ino:777 sk:9 cgroup:/user.slice <->\n')
