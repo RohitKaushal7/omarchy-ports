@@ -170,6 +170,9 @@ Everything runs as your user, with no elevated privileges.
   *before* that check, so a recycled PID can never receive it.
 - A container is only stopped if Docker still reports it running, and only by
   an id Docker itself returned.
+- The filter field is built when the panel opens and destroyed when it
+  closes. Qt's editable text fields follow the clipboard while they exist,
+  so a closed panel never reads clipboard changes from other apps.
 - Open and copy pass a validated `http://address:port` URL to
   `/usr/bin/xdg-open` or `/usr/bin/wl-copy`.
 - Terminate, kill and stop all ask first, with Cancel selected, unless
@@ -191,7 +194,8 @@ Everything runs as your user, with no elevated privileges.
   captured `ss` and `docker inspect` output; `test_ports_system.py` runs
   against real child processes, the real `ss`, and a stand-in `docker`;
   `test_panel_markup.py` checks the QML keeps to the host's plain-text and
-  motion rules; `test_panel_qml.py` runs `tests/qml` under Qt 6's
+  motion rules, and builds its filter field only while the panel is open;
+  `test_panel_qml.py` runs `tests/qml` under Qt 6's
   `qmltestrunner`, and skips it where that isn't installed.
 
 ```bash

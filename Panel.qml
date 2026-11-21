@@ -335,7 +335,9 @@ Panel {
 
   // The popup's content is built the first time the panel opens, not on
   // every monitor at startup, and stays built after that. Until then these
-  // are null; the scan, the counts and the icon run without them.
+  // are null; the scan, the counts and the icon run without them. The filter
+  // field alone is built afresh on every open and destroyed on close, so
+  // searchField is null whenever the panel is closed.
   readonly property Item keys: panel.loadedContent
   readonly property Item listFlick: root.keys ? root.keys.listFlick : null
   readonly property Item listItems: root.keys ? root.keys.listItems : null
@@ -522,8 +524,14 @@ Panel {
     } else {
       if (root.confirmDialog) root.confirmDialog.opened = false
       root.pending = null
-      if (root.searchField) root.searchField.text = ""
+      root.clearFilter()
     }
+  }
+
+  // Empties the filter: the query, and the field when it is built.
+  function clearFilter() {
+    root.query = ""
+    if (root.searchField) root.searchField.text = ""
   }
 
   ScanQueue {
@@ -627,16 +635,16 @@ Panel {
       // What root-level code reaches in for, through panel.loadedContent.
       property alias listFlick: flick
       property alias listItems: listColumn
-      property alias searchField: search
+      property alias searchField: searchLoader.field
       property alias confirmDialog: confirm
       implicitHeight: layout.implicitHeight
       anchors.fill: parent
-      blocked: search.activeFocus && !confirm.opened
+      blocked: searchLoader.typing && !confirm.opened
 
+      // Esc empties the filter first, and closes once it is empty.
       onCloseRequested: {
         if (confirm.opened) root.cancelPending()
-        else if (search.text !== "") search.text = ""
-        else root.close()
+        else if (!searchLoader.clear()) root.close()
       }
       onTabRequested: function(direction) {
         if (confirm.opened) confirm.selectedIndex = confirm.selectedIndex === 0 ? 1 : 0
@@ -669,10 +677,7 @@ Panel {
         if (t === "r" || t === "R") root.refresh()
         else if (t === "c") root.perform(root.cursorListener, "copy")
         else if (t === "K") root.perform(root.cursorListener, "kill")
-        else if (t === "/" || /^[0-9]$/.test(t)) {
-          search.forceActiveFocus()
-          if (t !== "/") search.insert(search.cursorPosition, t)
-        }
+        else if (t === "/" || /^[0-9]$/.test(t)) searchLoader.takeKey(t)
       }
 
       Column {
@@ -706,27 +711,58 @@ Panel {
           }
         }
 
-        TextField {
-          id: search
+        // The filter field exists only while the panel is open. An editable
+        // Qt text input follows the clipboard for as long as it exists, and on
+        // Wayland that means fetching every clipboard change any app makes;
+        // a transfer that never completes would stall the shell. Built per
+        // open, the field cannot do that behind a closed panel. The query
+        // lives in root.query, and the space stays reserved while it is gone,
+        // so the card does not reflow as it fades out.
+        Loader {
+          id: searchLoader
+          readonly property TextField field: item as TextField
+          // True while the field has the keyboard.
+          readonly property bool typing: !!field && field.activeFocus
+          property real fieldHeight: 0
           width: parent.width
-          placeholderText: "Filter by port, name, project or image"
-          foreground: root.ink
-          font.family: root.fontFamily
-          onTextChanged: root.query = text
-          Keys.onEscapePressed: function(event) {
-            text = ""
+          height: field ? field.implicitHeight : fieldHeight
+          active: root.opened
+          onLoaded: fieldHeight = field.implicitHeight
+
+          // "/" or a digit typed in the list: focus the field, and keep the digit.
+          function takeKey(t) {
+            if (!field) return
+            field.forceActiveFocus()
+            if (t !== "/") field.insert(field.cursorPosition, t)
+          }
+
+          // Empties the field; false if there was nothing to empty.
+          function clear() {
+            if (!field || field.text === "") return false
+            field.text = ""
+            return true
+          }
+
+          // Esc empties the field, Down and Return move into the list; all
+          // three give the keyboard back to the list.
+          function leaveOn(event) {
+            if (!field) return
+            if (event.key === Qt.Key_Escape) field.text = ""
+            else if (event.key !== Qt.Key_Down && event.key !== Qt.Key_Return) return
             keyCatcher.forceActiveFocus()
+            if (event.key !== Qt.Key_Escape) root.moveCursor(1)
             event.accepted = true
           }
-          Keys.onDownPressed: function(event) {
-            keyCatcher.forceActiveFocus()
-            root.moveCursor(1)
-            event.accepted = true
-          }
-          Keys.onReturnPressed: function(event) {
-            keyCatcher.forceActiveFocus()
-            root.moveCursor(1)
-            event.accepted = true
+
+          sourceComponent: Component {
+            TextField {
+              placeholderText: "Filter by port, name, project or image"
+              foreground: root.ink
+              font.family: root.fontFamily
+              Component.onCompleted: text = root.query
+              onTextChanged: root.query = text
+              Keys.onPressed: function(event) { searchLoader.leaveOn(event) }
+            }
           }
         }
 
