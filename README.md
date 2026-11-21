@@ -158,6 +158,9 @@ Everything runs as your user, with no elevated privileges.
   Desktop's `desktop-linux`. A `tcp://` or `ssh://` host or context is
   skipped, and the panel says so. The socket is looked up once per scan or
   stop and passed to every `docker` call that follows as `DOCKER_HOST`.
+- Known limit: a `unix://` socket can itself be a forward to another machine
+  (`ssh -L /tmp/docker.sock:/var/run/docker.sock`, say). The helper cannot
+  tell, so that daemon's published ports would be listed as this machine's.
 - The helper reads `ss` and `/proc`, and runs `docker context inspect`,
   `docker ps` and `docker inspect` when Docker support is on. It makes no
   network requests.
